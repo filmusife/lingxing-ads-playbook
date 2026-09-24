@@ -1,0 +1,16 @@
+interface:
+  display_name: "领星广告调整手册"
+  short_description: "Deep Lingxing ads audit and full adjustment playbook"
+  brand_color: "#1677FF"
+  default_prompt: "Use $lingxing-ads-playbook to audit Amazon ads for ASIN {ASIN} on {COUNTRY} via Lingxing MCP. Build the feature card and stage card first, join searchrank before negating, apply config-snapshot cooldowns, and give a complete product-fit adjustment playbook. Works for any category."
+
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "lingxing-mcp"
+      description: "Lingxing OpenMCP for Amazon ads, listing, and FBA reports"
+      transport: "streamable_http"
+      url: "https://openmcp.lingxing.com/mcp-servers/lingxing-mcp"
+
+policy:
+  allow_implicit_invocation: true
