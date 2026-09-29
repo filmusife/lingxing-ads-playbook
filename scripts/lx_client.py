@@ -22,23 +22,71 @@ def _codex_home() -> Path:
     return Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
 
 
+def _gemini_home() -> Path:
+    return Path(os.environ.get("GEMINI_HOME") or (Path.home() / ".gemini"))
+
+
 def load_mcp_config() -> dict[str, str]:
+    # 1. Check environment variables
     url = os.environ.get("LINGXING_MCP_URL") or DEFAULT_URL
     key = os.environ.get("LINGXING_MCP_KEY") or ""
+    if key:
+        return {"url": url, "key": key}
+
+    # 2. Check Antigravity / Gemini global and local mcp_config.json
+    gemini_mcp_paths = [
+        _gemini_home() / "config" / "mcp_config.json",
+        Path.cwd() / ".gemini" / "mcp_config.json",
+        Path.cwd() / ".agents" / "mcp_config.json",
+    ]
+    for p in gemini_mcp_paths:
+        if p.exists():
+            try:
+                content = p.read_text(encoding="utf-8").strip()
+                if content:
+                    data = json.loads(content)
+                    servers = data.get("mcpServers") or data.get("mcp_servers") or {}
+                    # Try matching variations of lingxing
+                    srv = None
+                    for name in ("lingxing-mcp", "LingXing-MCP", "lingxing", "lingxing_mcp"):
+                        if name in servers:
+                            srv = servers[name]
+                            break
+                    if srv and isinstance(srv, dict):
+                        url = srv.get("url") or srv.get("serverUrl") or url
+                        headers = srv.get("headers") or srv.get("http_headers") or {}
+                        key = (
+                            headers.get("X-Mcp-Key")
+                            or headers.get("x-mcp-key")
+                            or (srv.get("env") or {}).get("LINGXING_MCP_KEY")
+                            or key
+                        )
+                        if key:
+                            return {"url": url, "key": key}
+            except Exception:
+                pass
+
+    # 3. Check Codex config.toml
     cfg_path = _codex_home() / "config.toml"
     if cfg_path.exists():
-        with cfg_path.open("rb") as f:
-            cfg = tomllib.load(f)
-        server = (cfg.get("mcp_servers") or {}).get("lingxing-mcp") or {}
-        url = server.get("url") or url
-        headers = server.get("http_headers") or {}
-        key = headers.get("X-Mcp-Key") or headers.get("x-mcp-key") or key
-    if not key:
-        raise LingxingError(
-            "Missing Lingxing MCP key. Add [mcp_servers.lingxing-mcp.http_headers] "
-            "X-Mcp-Key in ~/.codex/config.toml or set LINGXING_MCP_KEY."
-        )
-    return {"url": url, "key": key}
+        try:
+            with cfg_path.open("rb") as f:
+                cfg = tomllib.load(f)
+            server = (cfg.get("mcp_servers") or {}).get("lingxing-mcp") or {}
+            url = server.get("url") or url
+            headers = server.get("http_headers") or {}
+            key = headers.get("X-Mcp-Key") or headers.get("x-mcp-key") or key
+            if key:
+                return {"url": url, "key": key}
+        except Exception:
+            pass
+
+    raise LingxingError(
+        "Missing Lingxing MCP key. Please configure it via one of:\n"
+        "1. Environment variable: set LINGXING_MCP_KEY=<your_key>\n"
+        "2. Antigravity: add to ~/.gemini/config/mcp_config.json under mcpServers.lingxing-mcp.headers.X-Mcp-Key\n"
+        "3. Codex: add to ~/.codex/config.toml under [mcp_servers.lingxing-mcp.http_headers] X-Mcp-Key"
+    )
 
 
 def rpc(method: str, params: dict | None = None, timeout: int = 120) -> dict[str, Any]:
@@ -62,7 +110,15 @@ def rpc(method: str, params: dict | None = None, timeout: int = 120) -> dict[str
     try:
         obj = json.loads(body)
     except json.JSONDecodeError as exc:
-        raise LingxingError("Lingxing MCP returned non-JSON") from exc
+        trimmed = body.strip()
+        if trimmed.startswith("data:"):
+            lines = [l[5:].strip() for l in trimmed.splitlines() if l.strip().startswith("data:")]
+            try:
+                obj = json.loads("".join(lines))
+            except Exception:
+                raise LingxingError("Lingxing MCP returned non-JSON") from exc
+        else:
+            raise LingxingError("Lingxing MCP returned non-JSON") from exc
     if obj.get("error"):
         raise LingxingError(json.dumps(obj["error"], ensure_ascii=False))
     return obj.get("result") or {}
@@ -141,7 +197,7 @@ def paginate(tool_id: str, base_params: dict, page_key: str = "page", start: int
             break
         all_rows.extend(chunk)
         try:
-            length = int(params.get("length") or params.get("limit") or params.get("page_size") or 100)
+            length = int(params.get("length") or params.get("page_size") or params.get("limit") or 100)
         except (TypeError, ValueError):
             length = 100
         if len(chunk) < length:

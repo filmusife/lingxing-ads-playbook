@@ -2,6 +2,37 @@
 
 ## 配置位置
 
+支持以下三种配置方式（`lx_client.py` 会按顺序自动识别）：
+
+### 1. Antigravity 全局配置（推荐）
+
+在 `~/.gemini/config/mcp_config.json`（或项目 `.gemini/mcp_config.json`）中添加：
+
+```json
+{
+  "mcpServers": {
+    "lingxing-mcp": {
+      "url": "https://openmcp.lingxing.com/mcp-servers/lingxing-mcp",
+      "headers": {
+        "X-Mcp-Key": "<用户自己的 key，不要写进 skill 或聊天>"
+      }
+    }
+  }
+}
+```
+
+### 2. 环境变量（轻量/CI/脚本推荐）
+
+```bash
+# Windows PowerShell
+$env:LINGXING_MCP_KEY="<你的_key>"
+
+# Linux / macOS
+export LINGXING_MCP_KEY="<你的_key>"
+```
+
+### 3. Codex 配置（兼容原有模式）
+
 `%USERPROFILE%\.codex\config.toml`（Linux/macOS 为 `~/.codex/config.toml`）：
 
 ```toml
@@ -13,9 +44,7 @@ url = "https://openmcp.lingxing.com/mcp-servers/lingxing-mcp"
 X-Mcp-Key = "<用户自己的 key，不要写进 skill 或聊天>"
 ```
 
-环境变量备选：`LINGXING_MCP_KEY`、`LINGXING_MCP_URL`。
-
-用户若粘贴 JSON（`mcpServers.LingXing-MCP`），转换成上面的 toml，**不要把 key 复述出来**。Open API IP 白名单是另一条路，默认继续用 MCP。
+> ⚠️ **安全红线**：永远不要把 key 复述或打印出来。Open API IP 白名单是另一条路，默认继续用 MCP。
 
 ## 调用面
 

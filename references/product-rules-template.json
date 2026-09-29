@@ -1,0 +1,31 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ProductAdsRulesTemplate",
+  "description": "通用产品广告诊断规则配置模板（适用于任何品类/任何ASIN）。可放置于 work/{outdir}/product_rules.json 或通过 --rules 传入。若未提供此文件，系统将基于亚马逊后台 Listing 标题、品牌、属性自动构建画像分桶。",
+  "target_acos": 25.0,
+  "is_patterns": [
+    {
+      "pattern": "\\b(core_keyword_1|core_keyword_2)\\b",
+      "label": "core_feature",
+      "note": "本品核心形态与主要卖点词（应该花钱并重点追求 TOS 的搜索词）"
+    }
+  ],
+  "is_not_patterns": [
+    {
+      "pattern": "\\b(wrong_attribute_1|unsupported_feature|misfit_type)\\b",
+      "label": "is_not",
+      "note": "本品不具备的功能/不兼容的型号/错品类词根（即使出单也优先否定）"
+    }
+  ],
+  "adjacent_patterns": [
+    {
+      "pattern": "\\b(compatible_scenario|related_gift_word)\\b",
+      "label": "adjacent",
+      "note": "相关但非核心主粮词（低预算防守，不盲目冲 TOS）"
+    }
+  ],
+  "competitor_brands": [
+    "competitor_brand_a",
+    "competitor_brand_b"
+  ]
+}

@@ -1,17 +1,16 @@
 # -*- coding: utf-8 -*-
-"""Fetch Lingxing listing, stock, and ads reports for one ASIN + country."""
+"""Fetch Lingxing listing, stock, ads reports, dayparting, traffic, and profit intelligence for one ASIN + country."""
 
 from __future__ import annotations
 
 import argparse
 import json
 import sys
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import lx_client as lx
-import product_scope as scope
 
 COUNTRY_ALIASES = {
     "美国": "US", "usa": "US", "us": "US", "amazon.com": "US",
@@ -45,6 +44,16 @@ def report_window(days: int) -> str:
     end = date.today() - timedelta(days=1)
     start = end - timedelta(days=days - 1)
     return f"{start.isoformat()} - {end.isoformat()}"
+
+
+def get_multi_windows(macro_days: int = 30) -> dict[str, str]:
+    """Calculate date windows for macro 30-day baseline, medium 7-day trend, and micro 3-day latest slice."""
+    yesterday = date.today() - timedelta(days=1)
+    return {
+        "macro_30d": f"{(yesterday - timedelta(days=macro_days - 1)).isoformat()} - {yesterday.isoformat()}",
+        "recent_7d": f"{(yesterday - timedelta(days=6)).isoformat()} - {yesterday.isoformat()}",
+        "recent_3d": f"{(yesterday - timedelta(days=2)).isoformat()} - {yesterday.isoformat()}",
+    }
 
 
 def shops_for_country(country: str) -> list[dict]:
@@ -128,152 +137,219 @@ def base_report_params(profile_id: str, window: str, extra: dict | None = None) 
     return params
 
 
-def fetch_reports(profile_id: str, window: str, outdir: Path, sku: str | None = None, asin: str | None = None) -> dict:
+def fetch_reports(
+    profile_id: str,
+    window: str,
+    outdir: Path,
+    sku: str | None = None,
+    asin: str | None = None,
+    portfolio_id: str | None = None,
+    windows_dict: dict[str, str] | None = None,
+) -> dict:
     pid = str(profile_id)
     bundle = {}
-    extra = {"sku": [sku]} if sku else None
+    extra = {"sku": [sku]} if sku else {}
+    if portfolio_id:
+        extra["portfolio_id"] = str(portfolio_id)
 
-    campaigns = lx.paginate("ad_campaign_report", base_report_params(pid, window, extra))
+    # 1. Campaigns (30-day Macro Baseline)
+    camp_params = base_report_params(pid, window, extra)
+    campaigns = lx.paginate("ad_campaign_report", camp_params)
     save(outdir / "campaign_report.json", campaigns)
     bundle["campaigns"] = len(campaigns)
 
+    # Multi-window fresh slices for dynamic delta and trend detection
+    w_7d = (windows_dict.get("recent_7d") if windows_dict else None) or report_window(7)
+    w_3d = (windows_dict.get("recent_3d") if windows_dict else None) or report_window(3)
+
+    try:
+        camp_params_7d = base_report_params(pid, w_7d, extra)
+        campaigns_7d = lx.paginate("ad_campaign_report", camp_params_7d)
+        save(outdir / "campaign_report_7d.json", campaigns_7d)
+        bundle["campaigns_7d"] = len(campaigns_7d)
+    except Exception as exc:
+        print(f"Warning: could not fetch campaign_report_7d: {exc}", file=sys.stderr)
+
+    try:
+        camp_params_3d = base_report_params(pid, w_3d, extra)
+        campaigns_3d = lx.paginate("ad_campaign_report", camp_params_3d)
+        save(outdir / "campaign_report_3d.json", campaigns_3d)
+        bundle["campaigns_3d"] = len(campaigns_3d)
+    except Exception as exc:
+        print(f"Warning: could not fetch campaign_report_3d: {exc}", file=sys.stderr)
+
+    # 2. Ad Groups
+    grp_extra = {"with_ring": 0, **({"sku": [sku]} if sku else {})}
+    if portfolio_id:
+        grp_extra["portfolio_id"] = [str(portfolio_id)]
     groups = lx.paginate(
         "ad_campaign_group_report",
-        base_report_params(pid, window, {"with_ring": 0, **({} if not sku else {"sku": [sku]})}),
+        base_report_params(pid, window, grp_extra),
     )
     save(outdir / "ad_groups.json", groups)
     bundle["groups"] = len(groups)
 
-    keywords = lx.paginate("ad_campaign_keyword_report", base_report_params(pid, window, extra if sku else None))
+    # 3. Keywords
+    kw_extra = dict(extra)
+    if portfolio_id:
+        kw_extra["portfolio_id"] = [str(portfolio_id)]
+    keywords = lx.paginate("ad_campaign_keyword_report", base_report_params(pid, window, kw_extra))
     save(outdir / "keywords.json", keywords)
     bundle["keywords"] = len(keywords)
 
+    # 4. Search Terms (with automatic translation)
+    st_extra = {"length": 100, "with_translation": 1, **({"sku": sku} if sku else {})}
+    if portfolio_id:
+        st_extra["portfolio_id"] = [str(portfolio_id)]
     search_terms = lx.paginate(
         "ad_campaign_search_term_report",
-        base_report_params(pid, window, {"length": 100, **({"sku": sku} if sku else {})}),
-        max_pages=30,
+        base_report_params(pid, window, st_extra),
+        max_pages=40,
     )
     save(outdir / "search_terms.json", search_terms)
     bundle["search_terms"] = len(search_terms)
 
+    # 5. Product Targets
+    tg_extra = {"with_ring": 0, "length": "100"}
+    if portfolio_id:
+        tg_extra["portfolio_id"] = [str(portfolio_id)]
     targets = lx.paginate(
         "ad_campaign_targeting_report",
-        base_report_params(pid, window, {"with_ring": 0, "length": "100"}),
+        base_report_params(pid, window, tg_extra),
+        max_pages=20,
     )
     save(outdir / "targets.json", targets)
     bundle["targets"] = len(targets)
 
+    # 6. Product Ads
+    prod_params = {
+        "report_date": window,
+        "profile_id": int(pid) if str(pid).isdigit() else pid,
+        "page": 1,
+        "length": 100,
+        "sort_field": "spends",
+        "sort_type": "desc",
+        "with_ring": False,
+    }
+    if portfolio_id:
+        prod_params["portfolio_id"] = [str(portfolio_id)]
     products = lx.paginate(
         "ad_campaign_product_report",
-        {
-            "report_date": window,
-            "profile_id": int(pid) if str(pid).isdigit() else pid,
-            "profile_ids": [pid],
-            "page": 1,
-            "length": 100,
-            "sort_field": "spends",
-            "sort_type": "desc",
-            "with_ring": 0,
-        },
+        prod_params,
+        max_pages=15,
     )
     save(outdir / "product_ads.json", products)
     bundle["product_ads"] = len(products)
 
+    # 7. Portfolios
     portfolios = lx.paginate(
         "ad_portfolio_report_shop",
         base_report_params(pid, window),
     )
     save(outdir / "portfolios.json", portfolios)
     bundle["portfolios"] = len(portfolios)
+
+    # 8. Keyword Analysis (ABA search rank / search volume)
+    try:
+        parts = [p.strip() for p in window.split(" - ")]
+        if len(parts) >= 2:
+            kw_analysis = lx.paginate(
+                "advertising_ad_analyze_keyword",
+                {
+                    "start_date": parts[0],
+                    "end_date": parts[1],
+                    "asin": [asin] if asin else None,
+                    "profile_id": int(pid) if str(pid).isdigit() else pid,
+                    "limit": 100,
+                },
+                max_pages=20,
+            )
+            save(outdir / "keyword_analysis.json", kw_analysis)
+            bundle["keyword_analysis"] = len(kw_analysis)
+    except Exception as exc:
+        print(f"Warning: could not fetch keyword_analysis: {exc}", file=sys.stderr)
+
     return bundle
 
 
-def split_window(window: str) -> tuple[str, str]:
-    if " - " not in (window or ""):
-        raise lx.LingxingError(f"Bad report window: {window}")
-    start, end = [x.strip() for x in window.split(" - ", 1)]
-    return start, end
+def fetch_advanced_intelligence(sid: str, sku: str | None, asin: str, window: str, outdir: Path) -> dict:
+    """Fetch Dayparting (Hourly/Weekly), Product Traffic Performance (Sessions/CVR), and Real Financial Profit."""
+    adv_bundle = {}
+    parts = [p.strip() for p in window.split(" - ")]
+    if len(parts) < 2:
+        return adv_bundle
+    start_date, end_date = parts[0], parts[1]
 
-
-def fetch_keyword_analysis(sid, profile_id, asin: str | None, msku: str | None, window: str) -> list[dict]:
-    """ABA search-frequency rank lives here as searchrank. No weekly search-volume number exists."""
-    start, end = split_window(window)
-    all_rows: list[dict] = []
-    pid = None
-    if profile_id is not None and str(profile_id).isdigit():
-        pid = int(profile_id)
-    # sponsored_type=sb currently returns the same SP payload; do not double-fetch.
-    for sponsored_type in ("sp",):
-        params = {
-            "start_date": start,
-            "end_date": end,
-            "page": 1,
-            "limit": 200,
-            "sponsored_type": sponsored_type,
-        }
-        if asin:
-            params["asin"] = [asin]
-        elif msku:
-            params["msku"] = [msku]
-        if sid is not None:
-            params["sid"] = str(sid)
-        elif pid is not None:
-            params["profile_id"] = pid
-        else:
-            continue
+    # 1. Dayparting: 24-hour and Day-of-Week Order Analysis
+    if sku:
         try:
-            rows = lx.paginate("advertising_ad_analyze_keyword", params, max_pages=20)
-        except Exception:
-            rows = []
-        for row in rows:
-            if isinstance(row, dict):
-                row["_sponsored_type"] = sponsored_type
-                all_rows.append(row)
-    return all_rows
+            h_res = lx.action("advertising_order_analysis_list", {
+                "sid": str(sid),
+                "sku": [sku],
+                "start_date": start_date,
+                "end_date": end_date,
+                "group_type": "hourly",
+            })
+            hourly_rows = lx.rows(h_res)
+            save(outdir / "order_analysis_hourly.json", hourly_rows)
+            adv_bundle["hourly_dayparting"] = len(hourly_rows)
+        except Exception as exc:
+            print(f"Warning: hourly order analysis failed: {exc}", file=sys.stderr)
 
+        try:
+            w_res = lx.action("advertising_order_analysis_list", {
+                "sid": str(sid),
+                "sku": [sku],
+                "start_date": start_date,
+                "end_date": end_date,
+                "group_type": "weekly",
+            })
+            weekly_rows = lx.rows(w_res)
+            save(outdir / "order_analysis_weekly.json", weekly_rows)
+            adv_bundle["weekly_dayparting"] = len(weekly_rows)
+        except Exception as exc:
+            print(f"Warning: weekly order analysis failed: {exc}", file=sys.stderr)
 
-def fetch_ops_log(sid, asin: str, days: int = 14) -> dict:
+    # 2. Product Traffic Performance (Sessions, Pageviews, Organic vs Ad CVR, TACOS)
+    try:
+        p_res = lx.action("query_product_performance_asin_lists", {
+            "sids": str(sid),
+            "search_field": "asin",
+            "search_value": [asin],
+            "start_date": start_date,
+            "end_date": end_date,
+            "offset": 0,
+            "length": 10,
+        })
+        perf_rows = lx.rows(p_res)
+        save(outdir / "product_performance.json", perf_rows)
+        adv_bundle["product_performance"] = len(perf_rows)
+    except Exception as exc:
+        print(f"Warning: product performance query failed: {exc}", file=sys.stderr)
 
-    end = date.today()
-    start = end - timedelta(days=days - 1)
-    payload = lx.action("analytics_log_list_v2", {
-        "start_date": start.isoformat(),
-        "end_date": end.isoformat(),
-        "summary_type": "asin",
-        "page_size": 50,
-        "offset": 0,
-        "sids": [str(sid)] if sid is not None else [],
-        "search_field": "asin",
-        "search_value": [asin],
-        "turn_on_summary": False,
-        "is_dimension_display": True,
-    })
-    return payload
-
-
-def fetch_daily_campaigns(profile_id: str, days: int = 7, portfolio_id=None) -> list[dict]:
-    """One page per day. Placement/bid fields are CURRENT snapshots; spend/CPC/impressions are historical."""
-    pid = str(profile_id)
-    out = []
-    end = date.today() - timedelta(days=1)
-    for offset in range(days):
-        day = end - timedelta(days=offset)
-        window = f"{day.isoformat()} - {day.isoformat()}"
-        params = {
-            "report_date": window,
-            "profile_ids": [pid],
-            "page": 1,
-            "length": 100,
-            "sort_field": "spends",
+    # 3. Real Profit Report (COGS, Logistics, Gross Profit, Selling & FBA Fees, Break-Even ACOS)
+    try:
+        profit_res = lx.action("query_order_profit_list", {
+            "start_date": start_date,
+            "end_date": end_date,
+            "currency_type": "USD",
+            "summary_field": "asin",
+            "turn_on_summary": "0",
             "sort_type": "desc",
-        }
-        if portfolio_id:
-            params["portfolio_id"] = str(portfolio_id)
-        payload = lx.action("ad_campaign_report", params)
-        rows = lx.rows(payload)
-        out.append({"date": day.isoformat(), "rows": rows})
-    out.sort(key=lambda x: x["date"])
-    return out
+            "length": "20",
+            "offset": "0",
+            "source_service": "mcp",
+            "external_service_mark": 1,
+            "search_field": "asin",
+            "search_value": [asin],
+        })
+        profit_rows = lx.rows(profit_res)
+        save(outdir / "order_profit.json", profit_rows)
+        adv_bundle["order_profit"] = len(profit_rows)
+    except Exception as exc:
+        print(f"Warning: order profit query failed: {exc}", file=sys.stderr)
+
+    return adv_bundle
 
 
 def filter_asin_campaigns(product_ads: list[dict], asin: str) -> set[str]:
@@ -294,7 +370,9 @@ def main() -> int:
     parser.add_argument("--asin", required=True)
     parser.add_argument("--country", required=True)
     parser.add_argument("--shop", default=None)
+    parser.add_argument("--portfolio", default=None, help="Optional portfolio name or portfolio_id filter")
     parser.add_argument("--days", type=int, default=30)
+    parser.add_argument("--db-dir", default=None, help="Optional path to database directory (default: workspace db/)")
     parser.add_argument("--outdir", required=True)
     args = parser.parse_args()
 
@@ -324,70 +402,86 @@ def main() -> int:
     msku = None
     if listing:
         msku = listing.get("msku") or listing.get("seller_sku")
+
+    # Resolve portfolio_id if --portfolio passed
+    portfolio_id = None
+    if args.portfolio:
+        pf_text = args.portfolio.strip()
+        if pf_text.isdigit():
+            portfolio_id = pf_text
+        else:
+            try:
+                pfs = lx.paginate("ad_portfolio_report_shop", base_report_params(str(shop.get("profile_id")), window))
+                # Try exact match first
+                for p in pfs:
+                    pname = str(p.get("name") or p.get("portfolio_name") or "").strip()
+                    if pf_text.lower() == pname.lower():
+                        portfolio_id = str(p.get("portfolio_id") or p.get("key"))
+                        break
+                # Try substring match fallback
+                if not portfolio_id:
+                    for p in pfs:
+                        pname = str(p.get("name") or p.get("portfolio_name") or "").strip()
+                        if pf_text.lower() in pname.lower():
+                            portfolio_id = str(p.get("portfolio_id") or p.get("key"))
+                            break
+            except Exception:
+                pass
+
+    multi_win = get_multi_windows(args.days)
+    window = multi_win["macro_30d"]
+
     try:
-        counts = fetch_reports(str(shop.get("profile_id")), window, outdir, sku=msku, asin=asin)
+        counts = fetch_reports(str(shop.get("profile_id")), window, outdir, sku=msku, asin=asin, portfolio_id=portfolio_id, windows_dict=multi_win)
         if counts.get("campaigns", 0) <= 1 and msku:
-            counts = fetch_reports(str(shop.get("profile_id")), window, outdir, sku=None, asin=asin)
+            counts = fetch_reports(str(shop.get("profile_id")), window, outdir, sku=None, asin=asin, portfolio_id=portfolio_id, windows_dict=multi_win)
     except Exception:
-        counts = fetch_reports(str(shop.get("profile_id")), window, outdir)
+        counts = fetch_reports(str(shop.get("profile_id")), window, outdir, portfolio_id=portfolio_id, windows_dict=multi_win)
+
+    # Advanced Intelligence: Dayparting, Traffic performance, Real profit
+    adv_counts = fetch_advanced_intelligence(str(shop.get("sid")), msku, asin, window, outdir)
+    counts.update(adv_counts)
+
     product_ads = json.loads((outdir / "product_ads.json").read_text(encoding="utf-8"))
     asin_keys = filter_asin_campaigns(product_ads, asin)
-    tokens = scope.belonging_tokens(asin, listing or {})
-    try:
-        camps = json.loads((outdir / "campaign_report.json").read_text(encoding="utf-8"))
-    except Exception:
-        camps = []
-    scoped = [r for r in camps if isinstance(r, dict) and r.get("name") and scope.campaign_belongs(r.get("name"), tokens)]
-    name_keys = {str(r.get("name")) for r in scoped}
-    asin_keys |= name_keys
-    pids = {str(r.get("portfolio_id")) for r in scoped if r.get("portfolio_id")}
-    portfolio_id = next(iter(pids)) if len(pids) == 1 else None
-
-    try:
-        ka_rows = fetch_keyword_analysis(shop.get("sid"), shop.get("profile_id"), asin, msku, window)
-        save(outdir / "keyword_analysis.json", ka_rows)
-        counts["keyword_analysis"] = len(ka_rows)
-        counts["keyword_analysis_with_searchrank"] = sum(
-            1 for r in ka_rows if r.get("searchrank") not in (None, "", 0, "0")
-        )
-    except Exception as exc:
-        save(outdir / "keyword_analysis.json", {"error": str(exc)})
-        counts["keyword_analysis"] = 0
-        counts["keyword_analysis_with_searchrank"] = 0
-
-    try:
-        ops_log = fetch_ops_log(shop.get("sid"), asin, days=14)
-        save(outdir / "ops_log.json", ops_log)
-        counts["ops_log"] = 1
-    except Exception as exc:
-        save(outdir / "ops_log.json", {"error": str(exc)})
-        counts["ops_log"] = 0
-    try:
-        daily = fetch_daily_campaigns(str(shop.get("profile_id")), days=7, portfolio_id=portfolio_id)
-        save(outdir / "daily_campaigns.json", daily)
-        counts["daily_campaign_days"] = len(daily)
-    except Exception as exc:
-        save(outdir / "daily_campaigns.json", {"error": str(exc)})
-        counts["daily_campaign_days"] = 0
-
     meta = {
         "asin": asin,
         "country": country,
         "shop_alias": shop.get("alias"),
         "sid": shop.get("sid"),
         "profile_id": shop.get("profile_id"),
+        "portfolio_id": portfolio_id,
+        "portfolio_name": args.portfolio,
+        "fetched_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "window": window,
         "days": args.days,
+        "windows": multi_win,
         "listing_found": bool(listing),
         "asin_campaign_keys": sorted(asin_keys),
-        "belonging_tokens": tokens,
-        "scoped_campaigns": sorted(name_keys),
         "counts": counts,
         "note": resolved.get("note"),
-        "portfolio_id": portfolio_id,
-        "change_detection": "config_snapshot + ops_log; placement/bid in reports are live snapshots",
     }
     save(outdir / "meta.json", meta)
+
+    # Optional DB record tracking
+    db_root = Path(args.db_dir) if args.db_dir else (Path("db") if Path("db").exists() else (outdir.parent / "db" if (outdir.parent / "db").exists() else None))
+    if db_root and db_root.exists():
+        daily_rec_dir = db_root / "daily_records"
+        daily_rec_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            log_line = json.dumps({
+                "fetched_at": meta["fetched_at"],
+                "asin": asin,
+                "country": country,
+                "portfolio_id": portfolio_id,
+                "outdir": str(outdir),
+                "counts": counts,
+            }, ensure_ascii=False)
+            with open(daily_rec_dir / "fetch_history.jsonl", "a", encoding="utf-8") as f:
+                f.write(log_line + "\n")
+        except Exception:
+            pass
+
     print(json.dumps({k: v for k, v in meta.items() if k != "asin_campaign_keys"}, ensure_ascii=False, indent=2))
     print("campaign keys", len(asin_keys))
     return 0

@@ -4,7 +4,7 @@
 
 ## 公共
 
-- `profile_ids`: **字符串数组**，如 `["<profile_id>"]`
+- `profile_ids`: **字符串数组**，如 `["1234567890123456"]`
 - `report_date`: `"2026-09-07 - 2026-09-20"`
 - `sort_field`: `spends`；`sort_type`: `desc`
 - `page`: 从 1 开始
@@ -30,27 +30,13 @@
 必填：`report_date, profile_ids`。仍要带 `page, length, sort_field, sort_type`。
 搜索词经常 800–2000 行，必须翻页。
 
-### advertising_ad_analyze_keyword
-这是目前能接到**搜索量代理**的只读工具。显示名「广告分析-关键词分析」，描述是搜索词分析。
-必填：`start_date, end_date`（最大 31 天）。`asin` 与 `msku` 二选一；`sid` 与 `profile_id` 二选一。
-实测更稳：`sid`（字符串）+ `asin` 数组 + `sponsored_type`（`sp`/`sb`）+ `page` + `limit`（最大 1000，脚本用 200）。
-不要用 `report_date`。`order.column=searchrank` 会报「排序字段异常」，默认按 spends 降序即可。
-关键返回字段：
-- `keyword_text` / `key`：用于和投放词、搜索词 join
-- `searchrank`：**ABA 搜索频率排名**，数字越小搜索量越大。这不是周搜索量绝对值。有的词没有该字段
-- `impressions, clicks, ctr, cvr, spends, orders, acos`：该词跨活动汇总
-- `localize_keyword_text`：中文对照，可辅助功能卡，不能代替属性表
-没有 searchrank 时标 `DATA_MISSING`，用曝光作代理。禁止把 searchrank 当成每周搜索次数。
-`query_erp_keyword_ranking_asin` / `_keyword` 只是已创建的排名监控目录，**不含搜索量**。对应写入工具 `create_erp_keyword` 默认不要调用。
-
 ### ad_campaign_targeting_report
-必填含 `with_ring`（number/int `0`）以及 `page, length, sort_field, sort_type`。
-`length` schema 可能是 string，传 `"100"` 或 `100` 都可以。
-`portfolio_id` 用数组。
+必填含 `with_ring`（整数 `0`）以及 `page, length, sort_field, sort_type`。
+注意：`length` 必须传字符串 `"100"`，`portfolio_id` 传字符串数组。
 
 ### ad_campaign_product_report
-必填：`report_date, profile_id`（注意是单数 integer）。
-同时传 `profile_ids` 更稳。用来确认哪些活动在投该 ASIN/MSKU。
+必填：`report_date, profile_id`（必须是单数整数 `int(pid)`）。
+**特别注意**：绝不能传 `profile_ids`（数组），否则报 HTTP 422 参数错误；`with_ring` 传 `False`。用来确认哪些活动投放了该 ASIN/MSKU。
 
 ### erp_listing
 必填：`offset, length, pvi_ids`。
@@ -58,22 +44,60 @@
 
 ```
 offset=0, length=20, pvi_ids="0", sids="<sid>", search_field="asin",
-search_value=["B0XXXX"], exact_search="1"
+search_value=["B0XXXXXXXX"], exact_search="1"
 ```
 
-`pvi_ids=""` 有时也能过。返回里要拿：标题、价格栈、stars、reviews、大类/小类 rank、父体、MSKU、可售、近 7/14/30 天销量与广告花费、**上架/首单、产品类型、在途**。
-
-阶段卡必看字段：`open_date` / `open_date_time`、`first_order_time`、`reviews_num`、`stars`、`average_seven_volume`、`average_fourteen_volume`、`average_thirty_volume`。
-
-价格栈必看：`landed_price`（成交/券后）、`listing_price`、`regular_price` / `list_price`、`history_price`。有券时不要用成交价 CVR 去扩发现。
-
-功能卡辅助：`item_name`、`amz_product_type`、`category_text`、`title_differentiation`、`variant_text`。这些仍不能替代属性表；没有的功能不要从标题里脑补成“有”。
-
-库存辅助：`afn_fulfillable_quantity`、`afn_inbound_working_quantity`、`afn_inbound_shipped_quantity`、`afn_inbound_receiving_quantity`、`afn_unsellable_quantity`、`reserved_customerorders`、`fba_fee`、`estimated_referral_fee`。
+`pvi_ids=""` 有时也能过。返回里要拿：标题、价格、stars、reviews、大类/小类 rank、父体、MSKU、可售、近 7/14/30 天销量与广告花费。
 
 ### get_fba_stock_list
 `sid`（字符串）、`search_field="asin"`、`search_value`（字符串不是数组）、`offset=0`、`length=20`、`is_hide_zero_stock="0"`。
 关注：`afn_fulfillable_quantity`、`available_total`、库龄、`short_term_historical_days_of_supply`、下月仓储费。
+
+### advertising_order_analysis_list (分时转化与出单洞察)
+按 24 小时或按周拆解转化与出单，用于分时调价与分时预算策略。
+- 必填：
+  - `sid`: 店铺 ID（字符串，如 `"<SID>"`)
+  - `sku`: SKU 列表（**必须是数组**，如 `["DEMO-SKU-001"]`）
+  - `start_date`, `end_date`: 日期字符串（如 `"2026-08-27"`）
+  - `group_type`: 枚举，`"hourly"` (24 小时分时) 或 `"weekly"` (按星期一至日)
+- 关键输出：`spend, ad_orders, store_orders, cvr, acos, cpc, impression, clicks`。
+
+### query_product_performance_asin_lists (Listing 宏观全域流量大盘)
+获取 Listing 宏观自然流量、总访客与转化承接力。
+- 必填：
+  - `sids`: 店铺 ID（**字符串**，如 `"<SID>"`，不要传数组）
+  - `search_field`: `"asin"`
+  - `search_value`: ASIN 数组，如 `["B0XXXXXXXX"]`
+  - `start_date`, `end_date`: 日期字符串
+  - `offset`: 0, `length`: 10
+- 关键输出：
+  - `sessions_total` (总访客 Sessions), `sessions_mobile` (移动端访客)
+  - `page_views_total` (总浏览量 Pageviews), `page_views_mobile`
+  - `ad_cvr` (广告转化率) vs `nature_cvr` (自然转化率)
+  - `adv_rate` (广告销量占比), `acoas` (全店 TACOS), `return_goods_rate` (退货率)
+
+### query_order_profit_list (真实财务利润与保本 ACOS 核算)
+精准获取产品单均采购成本、运费、FBA配送费与毛利，用于科学锚定保本 ACOS 天花板。
+- 必填（参数类型要求极其严格）：
+  - `start_date`, `end_date`: 日期字符串
+  - `currency_type`: `"USD"`
+  - `summary_field`: `"asin"`
+  - `turn_on_summary`: `"0"` (字符串)
+  - `sort_type`: `"desc"`
+  - `length`: `"20"` (字符串), `offset`: `"0"` (字符串)
+  - `source_service`: `"mcp"`, `external_service_mark`: `1` (数字)
+  - `search_field`: `"asin"`, `search_value`: `["B0XXXXXXXX"]` (数组)
+- 关键输出：
+  - `net_amount` (净销售额), `volume` (销量), `gross_profit` (毛利润), `gross_margin` (毛利率)
+  - `purchase_costs` (总采购成本 COGS) / `avg_purchase_costs`
+  - `logistics_costs` (头程头运费) / `avg_logistics_costs`
+  - `fba_fulfillment_fee` (FBA 配送费), `selling_fee` (平台佣金), `refund_amount_rate`
+  - **保本 ACOS 计算公式**：$\text{Break-Even ACOS} = \frac{\text{客单价} - \text{单均COGS} - \text{单均头程} - \text{单均FBA} - \text{单均佣金}}{\text{客单价}} \times 100\%$
+
+### ad_campaign_search_term_report (增强高级参数)
+- `with_translation`: 设为 `1`，自动对西语、德语等小语种搜索词提供英语/中文翻译。
+- `category`: 设为 `"HasClickNoDeal"`，直接精准过滤出高花费 0 转化、急需止血的出血词。
+- `targeted_type`: 设为 `"not_targeted"`，过滤出全账户尚未建立投放、急需收割的高潜转化词。
 
 ## 关键字段（分析时不要丢）
 
@@ -81,34 +105,12 @@ search_value=["B0XXXX"], exact_search="1"
 
 活动：`name, state, targeting_type, sponsored_type, daily_budget, bidding, placement_top, placement_product_page, placement_rest_of_search, default_bid, spends, sales, acos, cpc, cvr, ctr, impressions, clicks, orders, direct_orders, indirect_orders, top_of_search_impression_share`
 
-`bidding.strategy`：`manual` 固定竞价。动态提高+降低会叠在位置溢价上，发现仓和新品不要用。`adjustments[].predicate`：`placementTop` / `placementProductPage` / `placementRestOfSearch`。
+`bidding.strategy`：`manual` 固定竞价。`adjustments[].predicate`：`placementTop` / `placementProductPage` / `placementRestOfSearch`。
 
-关键词：`campaign_name, keyword_text, match_type, bid, default_bid, state, spends, sales, orders, clicks, cvr, cpc, ctr`，分析表另接 `searchrank, vol_band, ka_impr, hint`
+关键词：`campaign_name, keyword_text, match_type, bid, default_bid, state, spends, sales, orders, clicks, cvr, cpc, ctr`
 
-搜索词：`query, campaign_name, match_type/target_match_type, target_text/keyword_text, spends, sales, orders, clicks, cvr, cpc, is_asin, kw_negative, st_negative`，分析表另接 `searchrank, vol_band, ka_impr, hint`
+搜索词：`query, campaign_name, match_type/target_match_type, target_text/keyword_text, spends, sales, orders, clicks, cvr, cpc, is_asin, kw_negative, st_negative`
 
 投放：`exp_type` / `targeting_text`（紧密/宽泛/同类/关联/asinSameAs）、`bid`
 
-Listing：`item_name, open_date, open_date_time, first_order_time, landed_price, listing_price, regular_price, history_price, stars, reviews_num, small_rank, rank, parent_asin, msku, amz_product_type, category_text, afn_fulfillable_quantity, inbound 数量, seven/fourteen/thirty_volume, seven/fourteen/thirty_spend, seven/fourteen/thirty_amount`
-
-### analytics_log_list_v2
-必填：`start_date, end_date, summary_type, page_size`。
-`summary_type="asin"`，`search_field="asin"`，`search_value=[ASIN]`，`sids=[sid]`。
-广告改动在 `auto_log_data[日期].log_data`：
-- 501 `[广告活动] 修改...` → 锁这些活动的 TOS/PP/ROS/日预算 7 天
-- 502 `[广告组] 修改...` → 锁默认基础竞价 7 天
-- 504 `[投放] 修改N个` → 锁关键词/ASIN 基础竞价 7 天
-- 505 `[否定投放] 新建N个` → 不锁溢价
-拿不到 before/after 数值，只拿得到改动日和对象。历史 TOS/基础竞价不要从逐日报表的 placement/bid 字段读，那些是当前快照。
-
-### 逐日活动报告（冷却佐证）
-同一套 `ad_campaign_report`，`report_date` 改成单日 `YYYY-MM-DD - YYYY-MM-DD`，连续拉 7 天。
-历史可用：spends, cpc, impressions, clicks, orders。
-不可当历史：placement_top/product_page/rest_of_search, daily_budget, bid, default_bid, updated_at。
-
-### 配置快照差分
-分析脚本会把当前自变量写到 `~/.codex/skills/lingxing-ads-playbook/state/{profile_id}_{ASIN}.json`。
-比对字段：TOS/PP/ROS、daily_budget、state、广告组 default_bid、关键词/投放 bid。
-不比对 CPC、花费、曝光。那些是结果，不是控制变量。
-第一次运行没有旧快照，只写入；第二次开始才产出 `config_diff.tsv`。
-快照按 profile+ASIN 分文件，任意品类共用这套逻辑，互不串锁。
+Listing & 财务：`item_name, listing_price, stars, reviews_num, small_rank, rank, parent_asin, msku, afn_fulfillable_quantity, seven/fourteen/thirty_volume, seven/fourteen/thirty_spend, seven/fourteen/thirty_amount, gross_margin, cogs, break_even_acos, sessions_total, ad_cvr, nature_cvr, tacos`

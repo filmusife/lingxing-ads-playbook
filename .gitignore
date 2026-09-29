@@ -3,6 +3,11 @@ __pycache__/
 *.pyo
 state/
 work/
+db/
+outputs/
+snapshots/
+*.tsv
+*.jsonl
 .env
 .env.*
 *.log
