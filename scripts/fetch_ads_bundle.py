@@ -189,13 +189,29 @@ def fetch_reports(
     save(outdir / "ad_groups.json", groups)
     bundle["groups"] = len(groups)
 
-    # 3. Keywords
+    # 3. Keywords (30d macro, 7d trend, 3d micro)
     kw_extra = dict(extra)
     if portfolio_id:
         kw_extra["portfolio_id"] = [str(portfolio_id)]
     keywords = lx.paginate("ad_campaign_keyword_report", base_report_params(pid, window, kw_extra))
     save(outdir / "keywords.json", keywords)
     bundle["keywords"] = len(keywords)
+
+    try:
+        kw_params_7d = base_report_params(pid, w_7d, kw_extra)
+        keywords_7d = lx.paginate("ad_campaign_keyword_report", kw_params_7d)
+        save(outdir / "keywords_7d.json", keywords_7d)
+        bundle["keywords_7d"] = len(keywords_7d)
+    except Exception as exc:
+        print(f"Warning: could not fetch keywords_7d: {exc}", file=sys.stderr)
+
+    try:
+        kw_params_3d = base_report_params(pid, w_3d, kw_extra)
+        keywords_3d = lx.paginate("ad_campaign_keyword_report", kw_params_3d)
+        save(outdir / "keywords_3d.json", keywords_3d)
+        bundle["keywords_3d"] = len(keywords_3d)
+    except Exception as exc:
+        print(f"Warning: could not fetch keywords_3d: {exc}", file=sys.stderr)
 
     # 4. Search Terms (with automatic translation)
     st_extra = {"length": 100, "with_translation": 1, **({"sku": sku} if sku else {})}
@@ -209,7 +225,7 @@ def fetch_reports(
     save(outdir / "search_terms.json", search_terms)
     bundle["search_terms"] = len(search_terms)
 
-    # 5. Product Targets
+    # 5. Product Targets (30d macro, 7d trend, 3d micro)
     tg_extra = {"with_ring": 0, "length": "100"}
     if portfolio_id:
         tg_extra["portfolio_id"] = [str(portfolio_id)]
@@ -220,6 +236,22 @@ def fetch_reports(
     )
     save(outdir / "targets.json", targets)
     bundle["targets"] = len(targets)
+
+    try:
+        tg_params_7d = base_report_params(pid, w_7d, tg_extra)
+        targets_7d = lx.paginate("ad_campaign_targeting_report", tg_params_7d, max_pages=20)
+        save(outdir / "targets_7d.json", targets_7d)
+        bundle["targets_7d"] = len(targets_7d)
+    except Exception as exc:
+        print(f"Warning: could not fetch targets_7d: {exc}", file=sys.stderr)
+
+    try:
+        tg_params_3d = base_report_params(pid, w_3d, tg_extra)
+        targets_3d = lx.paginate("ad_campaign_targeting_report", tg_params_3d, max_pages=20)
+        save(outdir / "targets_3d.json", targets_3d)
+        bundle["targets_3d"] = len(targets_3d)
+    except Exception as exc:
+        print(f"Warning: could not fetch targets_3d: {exc}", file=sys.stderr)
 
     # 6. Product Ads
     prod_params = {
@@ -425,6 +457,25 @@ def main() -> int:
                         if pf_text.lower() in pname.lower():
                             portfolio_id = str(p.get("portfolio_id") or p.get("key"))
                             break
+                # Fallback: find portfolio_id from ad_campaign_report
+                if not portfolio_id:
+                    try:
+                        c_res = lx.paginate("ad_campaign_report", {
+                            "profile_ids": [str(shop.get("profile_id"))],
+                            "report_date": window,
+                            "page": 1,
+                            "length": 100,
+                            "sort_field": "spends",
+                            "sort_type": "desc",
+                        })
+                        for c in c_res:
+                            c_pname = str(c.get("portfolio_name") or "").strip()
+                            if pf_text.lower() == c_pname.lower() or pf_text.lower() in c_pname.lower():
+                                if c.get("portfolio_id"):
+                                    portfolio_id = str(c["portfolio_id"])
+                                    break
+                    except Exception:
+                        pass
             except Exception:
                 pass
 

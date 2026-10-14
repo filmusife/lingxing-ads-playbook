@@ -31,6 +31,9 @@
 7. **全美 ABA 搜索量梯队与多维广告位指纹诊断**：
    - 自动对齐全美 ABA 搜索排名（Top 5K 超大词 / Top 30K 头部大词 / Top 150K 腰部特征词 / 长尾词）。
    - 结合 CTR/CPC 指纹推断真实展示位，精准拯救被困在商品页/低效位的潜质好词（`TRAPPED_CORE_HERO`），抑制顶部饱和耗散词（`FAILED_AT_TOS`）。
+8. **停运实体绝对隔离与鲜活断流防误杀 (Paused Guardrail & Traffic-Floor Protection)**：
+   - 严禁向处于 `paused` 状态或所属活动已暂停的实体提出调低出价或重复暂停建议；
+   - 调低基础竞价必须穿透校验近 3 天/7 天鲜活表现（`imp_3d`, `spend_3d`），对调后已零曝光止血的词坚决保持观察期，严禁二次打压导致彻底丧失权重；增设 $0.20 竞价保底防线。
 
 ---
 
@@ -115,6 +118,7 @@ python scripts/analyze_ads_bundle.py --indir work/lx-ads --outdir work/lx-ads/an
 - `--portfolio <PORTFOLIO_ID_OR_NAME>`：筛选指定广告组合
 - `--target-acos <FLOAT>`：手动指定目标 ACOS 阈值（默认自动基于保本 ACOS 的 68% 科学锚定）
 - `--rules <PATH>`：自定义精准产品特征分桶规则（参考 `references/product-rules-template.json`）
+- `--known-negatives <PATH_OR_LIST>`：指定已否定词列表或文件路径，防止重复推荐已知否定词
 
 ---
 
@@ -122,7 +126,7 @@ python scripts/analyze_ads_bundle.py --indir work/lx-ads --outdir work/lx-ads/an
 
 ```
 lingxing-ads-playbook/
-├── SKILL.md                          # 22 条一线操盘核心铁律与端到端标准化流程
+├── SKILL.md                          # 24 条一线操盘核心铁律与端到端标准化流程
 ├── README.md                         # 仓库说明与部署使用指南
 ├── agents/
 │   └── openai.yaml                   # MCP 工具依赖与代理声明

@@ -305,6 +305,19 @@ def campaign_rows(raw: list[dict]) -> list[dict]:
         if skip_total(r) or not r.get("name"):
             continue
         tos, pp, ros = placement(r)
+        bidding = r.get("bidding") or {}
+        strat = bidding.get("strategy") if isinstance(bidding, dict) else r.get("bidding_strategy")
+        btype = str(r.get("bidding_type") or "")
+        if strat == "manual" or "固定" in btype or "fixed" in btype.lower():
+            bidding_strategy_desc = "固定竞价 (Fixed Bids)"
+        elif strat == "legacyForSales" or "仅降低" in btype or "down" in btype.lower():
+            bidding_strategy_desc = "动态竞价 - 仅降低 (Dynamic Bids - Down Only)"
+        elif strat == "autoForSales" or "提高和降低" in btype or "up" in btype.lower():
+            bidding_strategy_desc = "动态竞价 - 提高和降低 (Dynamic Bids - Up & Down)"
+        elif strat == "ruleBased" or "规则" in btype:
+            bidding_strategy_desc = "基于规则的竞价 (Rule-based Bidding)"
+        else:
+            bidding_strategy_desc = btype if btype else (str(strat) if strat else "固定竞价 (Fixed Bids)")
         out.append({
             "name": r.get("name"),
             "id": r.get("campaign_id"),
@@ -313,6 +326,7 @@ def campaign_rows(raw: list[dict]) -> list[dict]:
             "sponsored": r.get("sponsored_type"),
             "budget": num(r.get("daily_budget") or r.get("budget")),
             "tos": tos, "pp": pp, "ros": ros,
+            "bidding_strategy": bidding_strategy_desc,
             "spend": num(r.get("spends")),
             "sales": num(r.get("sales")),
             "acos": num(r.get("acos")),
@@ -619,21 +633,25 @@ def extract_active_negatives(sts: list[dict]) -> tuple[dict[tuple[str, str], dic
 
 
 def find_exact_harvest_campaign(camps: list[dict], kws: list[dict]) -> str:
-    """Find the best campaign for harvesting exact terms (e.g. *-exact-prove or *-精准)."""
+    """Find the best ENABLED campaign for harvesting exact terms (e.g. *-exact-prove or *-精准)."""
     for c in camps:
-        name = c.get("name") or c.get("campaign_name") or ""
-        if "exact-prove" in name.lower() or "prove" in name.lower():
-            return name
+        if c.get("state") == "enabled":
+            name = c.get("name") or c.get("campaign_name") or ""
+            if "exact-prove" in name.lower() or "prove" in name.lower():
+                return name
     for c in camps:
-        name = c.get("name") or c.get("campaign_name") or ""
-        if "exact" in name.lower() or "精准" in name:
-            return name
+        if c.get("state") == "enabled":
+            name = c.get("name") or c.get("campaign_name") or ""
+            if "exact" in name.lower() or "精准" in name:
+                return name
     for k in kws:
-        name = k.get("campaign_name") or ""
-        if "exact-prove" in name.lower() or "prove" in name.lower():
-            return name
-    if camps:
-        first_c = camps[0].get("name") or ""
+        if k.get("state") == "enabled":
+            name = k.get("campaign_name") or ""
+            if "exact-prove" in name.lower() or "prove" in name.lower():
+                return name
+    enabled_camps = [c for c in camps if c.get("state") == "enabled"]
+    if enabled_camps:
+        first_c = enabled_camps[0].get("name") or ""
         parts = first_c.split("-")
         if len(parts) >= 2:
             return f"{parts[0]}-{parts[1]}-SP-EXACT-PROVE"
@@ -940,31 +958,42 @@ def audit_active_negatives(
             elif paused_other:
                 # Check if it's a converting or high-relevance query worth reviving
                 if is_strong_relevance or orders >= 1 or (sr is not None and sr < 40000):
-                    audit_status = "MIGRATED_BUT_PAUSED_IN_EXACT"
-                    recom_action = "Unpause_In_Exact"
                     # Pick best destination campaign to unpause (prefer exact-prove or highest past orders)
                     best_dest = sorted(paused_other, key=lambda x: -x["orders"])[0]
                     dest_camp = best_dest["campaign"]
                     dest_match = best_dest["match"]
-                    
-                    recom_bid, eff_tos, bid_calc_desc = calc_dynamic_migration_bid(
-                        item, dest_camp, camp_lookup, prior_target=best_dest
-                    )
-                    recom_val = f"Unpause in {dest_camp} (Exact, 基础竞价 ${recom_bid:.2f}); Maintain Negative in {c_name}"
-                    detail_reason = (
-                        f"移词断流全账户堵死：该词已移词并在原活动 ({c_name}) 否定，但在精准仓 ({dest_camp}) 处于暂停状态，导致全账户完全断流 "
-                        f"({orders}单, SR={sr_display}, {v_tier})。{bid_calc_desc} "
-                        f"处理：在 {dest_camp} 重新开启投放（基础竞价 ${recom_bid:.2f}）；原活动 {c_name} 继续保持否定防内耗。"
-                    )
-                    unnegative_adjustments.append({
-                        "action_type": "Unpause_Keyword",
-                        "campaign": dest_camp,
-                        "target_entity": q,
-                        "match_type": dest_match,
-                        "current_value": "state=paused",
-                        "recommended_value": f"state=enabled (基础竞价 ${recom_bid:.2f})",
-                        "reason": f"移词断流恢复：在 {c_name} 保持否定防内耗，在 {dest_camp} 开启投放。{bid_calc_desc}",
-                    })
+                    dest_camp_obj = camp_lookup.get(dest_camp, {})
+                    dest_camp_state = dest_camp_obj.get("state", "enabled")
+
+                    if dest_camp_state != "enabled":
+                        audit_status = "MIGRATED_TO_PAUSED_CAMPAIGN"
+                        recom_action = "Keep_Negated_In_Broad"
+                        recom_val = f"Maintain Negated in {c_name} (Destination {dest_camp} is Paused)"
+                        detail_reason = (
+                            f"该词此前移入的活动 {dest_camp} 目前已整组暂停，原广泛仓保持否定防内耗；"
+                            f"如需重新测试该词，建议启用目标活动或在其他活跃精准仓投放。"
+                        )
+                    else:
+                        audit_status = "MIGRATED_BUT_PAUSED_IN_EXACT"
+                        recom_action = "Unpause_In_Exact"
+                        recom_bid, eff_tos, bid_calc_desc = calc_dynamic_migration_bid(
+                            item, dest_camp, camp_lookup, prior_target=best_dest
+                        )
+                        recom_val = f"Unpause in {dest_camp} (Exact, 基础竞价 ${recom_bid:.2f}); Maintain Negative in {c_name}"
+                        detail_reason = (
+                            f"移词断流全账户堵死：该词已移词并在原活动 ({c_name}) 否定，但在精准仓 ({dest_camp}) 处于暂停状态，导致全账户完全断流 "
+                            f"({orders}单, SR={sr_display}, {v_tier})。{bid_calc_desc} "
+                            f"处理：在 {dest_camp} 重新开启投放（基础竞价 ${recom_bid:.2f}）；原活动 {c_name} 继续保持否定防内耗。"
+                        )
+                        unnegative_adjustments.append({
+                            "action_type": "Unpause_Keyword",
+                            "campaign": dest_camp,
+                            "target_entity": q,
+                            "match_type": dest_match,
+                            "current_value": "state=paused",
+                            "recommended_value": f"state=enabled (基础竞价 ${recom_bid:.2f})",
+                            "reason": f"移词断流恢复：在 {c_name} 保持否定防内耗，在 {dest_camp} 开启投放。{bid_calc_desc}",
+                        })
                 else:
                     audit_status = "SOFT_MONITOR"
                     recom_action = "Keep_Paused"
@@ -973,37 +1002,58 @@ def audit_active_negatives(
 
             # Case C: Not targeted in ANY other campaign (True Orphan or Soft Monitor)
             else:
-                is_core_asset = (
-                    bucket == "brand"
-                    or is_strong_relevance
-                    or bucket in ("core_feature", "core_or_title")
-                    or bucket.startswith("core_")
-                    or orders >= 1
-                    or (sr is not None and sr < 35000)
-                )
+                misfit_found = False
+                for pat_item in rules.get("is_not_patterns", []):
+                    pat = pat_item if isinstance(pat_item, str) else pat_item.get("pattern", "")
+                    if pat and re.search(pat, q, re.I):
+                        misfit_found = True
+                        break
 
-                if is_core_asset:
-                    audit_status = "TRUE_ORPHAN_NEGATIVE"
-                    recom_action = "Harvest_To_Exact"
-                    recom_bid, eff_tos, bid_calc_desc = calc_dynamic_migration_bid(
-                        item, harvest_camp, camp_lookup, prior_target=None
-                    )
-                    recom_val = f"Harvest into {harvest_camp} (Exact, 基础竞价 ${recom_bid:.2f}) or Un-negate in Broad"
-                    detail_reason = (
-                        f"全账户未投放孤儿核心资产：强相关意图/出单/搜索词 ({orders}单, SR={sr_display}, {v_tier})，"
-                        f"但在 {c_name} 被否定且全账户未在任何活动投放。{bid_calc_desc} "
-                        f"处理：移入精准仓 ({harvest_camp}) 收割（基础竞价 ${recom_bid:.2f}）；原活动 {c_name} 保持否定防内耗。"
-                    )
-                    unnegative_adjustments.append({
-                        "action_type": "Harvest_To_Exact",
-                        "campaign": harvest_camp,
-                        "target_entity": q,
-                        "match_type": "exact",
-                        "current_value": f"Negated in {c_name}, untargeted in portfolio",
-                        "recommended_value": f"Add Exact Target (基础竞价 ${recom_bid:.2f})",
-                        "reason": f"孤儿核心资产收割：在 {c_name} 保持否定防内耗，移入 {harvest_camp} 独立收割。{bid_calc_desc}",
-                    })
+                if misfit_found:
+                    audit_status = "SAFE_HARD_NEGATIVE"
+                    recom_action = "Keep_Negated"
+                    recom_val = "Maintain Negative (Permanent Misfit)"
+                    detail_reason = f"Confirmed physical/category conflict via rules. Hard negative eliminates structural waste/bad reviews."
                 else:
+                    is_core_asset = (
+                        bucket == "brand"
+                        or is_strong_relevance
+                        or bucket in ("core_feature", "core_or_title")
+                        or bucket.startswith("core_")
+                        or orders >= 1
+                        or (sr is not None and sr < 35000)
+                    )
+
+                    harvest_camp_obj = camp_lookup.get(harvest_camp, {})
+                    harvest_camp_state = harvest_camp_obj.get("state", "enabled")
+
+                    if is_core_asset and harvest_camp_state == "enabled":
+                        audit_status = "TRUE_ORPHAN_NEGATIVE"
+                        recom_action = "Harvest_To_Exact"
+                        recom_bid, eff_tos, bid_calc_desc = calc_dynamic_migration_bid(
+                            item, harvest_camp, camp_lookup, prior_target=None
+                        )
+                        recom_val = f"Harvest into {harvest_camp} (Exact, 基础竞价 ${recom_bid:.2f}) or Un-negate in Broad"
+                        detail_reason = (
+                            f"全账户未投放孤儿核心资产：强相关意图/出单/搜索词 ({orders}单, SR={sr_display}, {v_tier})，"
+                            f"但在 {c_name} 被否定且全账户未在任何活动投放。{bid_calc_desc} "
+                            f"处理：移入精准仓 ({harvest_camp}) 收割（基础竞价 ${recom_bid:.2f}）；原活动 {c_name} 保持否定防内耗。"
+                        )
+                        unnegative_adjustments.append({
+                            "action_type": "Harvest_To_Exact",
+                            "campaign": harvest_camp,
+                            "target_entity": q,
+                            "match_type": "exact",
+                            "current_value": f"Negated in {c_name}, untargeted in portfolio",
+                            "recommended_value": f"Add Exact Target (基础竞价 ${recom_bid:.2f})",
+                            "reason": f"孤儿核心资产收割：在 {c_name} 保持否定防内耗，移入 {harvest_camp} 独立收割。{bid_calc_desc}",
+                        })
+                    else:
+                        audit_status = "SOFT_MONITOR"
+                        recom_action = "Keep_Negated_Monitor"
+                        recom_val = f"Maintain Negated in {c_name}"
+                        detail_reason = f"Untargeted search term (orders={orders}, spend=${spend:.2f}); maintain negative and monitor."
+
                     audit_status = "SOFT_MONITOR"
                     recom_action = "Keep_Negated_Offpeak"
                     recom_val = "Maintain Negative; Re-test in Q4 Holiday Season"
@@ -1031,16 +1081,19 @@ def audit_active_negatives(
     return audit_records, unnegative_adjustments
 
 
-def audit_keyword_misfits(kws: list[dict], rules: dict) -> list[dict]:
-    """Audit enabled keywords to detect physical misfits targeting wrong attributes."""
+def audit_keyword_misfits(kws: list[dict], rules: dict, camps: list[dict] = None) -> list[dict]:
+    """Audit enabled keywords in enabled campaigns to detect physical misfits targeting wrong attributes."""
     adjustments = []
+    camp_lookup = {c.get("name") or c.get("campaign_name"): c for c in (camps or [])}
     is_not_patterns = rules.get("is_not_patterns", [])
     for k in kws:
         if k.get("state") != "enabled":
             continue
+        c_name = k.get("campaign_name") or ""
+        if camp_lookup and camp_lookup.get(c_name, {}).get("state") != "enabled":
+            continue
         text = str(k.get("keyword_text") or k.get("targeting_text") or "").strip()
         bid = num(k.get("bid"))
-        c_name = k.get("campaign_name") or ""
         for pat_item in is_not_patterns:
             pat = pat_item if isinstance(pat_item, str) else pat_item.get("pattern", "")
             label = "is_not" if isinstance(pat_item, str) else pat_item.get("label", "is_not")
@@ -1676,12 +1729,35 @@ def main() -> None:
     parser.add_argument("--cooldown-days", type=int, default=7, help="Cooldown observation period in days (default: 7)")
     parser.add_argument("--target-acos", type=float, default=None, help="Target ACOS percent threshold (e.g. 25.0)")
     parser.add_argument("--timestamp", default=None, help="Optional timestamp string (e.g. 20260926-104901). Defaults to current local time.")
+    parser.add_argument("--known-negatives", default=None, help="Comma-separated or file path of already negated keywords/phrases")
     parser.add_argument("--export-dir", default=None, help="Optional export directory (e.g. outputs) to export timestamped bulk adjustments table.")
     args = parser.parse_args()
 
     src = Path(args.indir)
     dest = Path(args.outdir)
     dest.mkdir(parents=True, exist_ok=True)
+
+    # Load known negatives to prevent redundant recommendations
+    known_negatives = set()
+    for kn_candidate in [src / "known_negatives.txt", Path("known_negatives.txt"), src / "known_negatives.json", Path("known_negatives.json")]:
+        if kn_candidate.exists():
+            try:
+                if kn_candidate.suffix == ".json":
+                    data = json.loads(kn_candidate.read_text(encoding="utf-8"))
+                    if isinstance(data, list):
+                        known_negatives.update(str(x).strip().lower() for x in data if str(x).strip())
+                else:
+                    for l in kn_candidate.read_text(encoding="utf-8").splitlines():
+                        t = l.strip().lower()
+                        if t and not t.startswith("#"):
+                            known_negatives.add(t)
+            except Exception:
+                pass
+    if getattr(args, "known_negatives", None):
+        for item in str(args.known_negatives).split(","):
+            t = item.strip().lower()
+            if t:
+                known_negatives.add(t)
 
     meta = load_json(src / "meta.json") or {}
     listing = load_json(src / "listing.json")
@@ -1744,7 +1820,16 @@ def main() -> None:
         if asin and row_asin == asin and row.get("campaign_name"):
             asin_campaigns.add(row.get("campaign_name"))
 
-    camps = campaign_rows(as_rows(load_json(src / "campaign_report.json")))
+    raw_campaigns = as_rows(load_json(src / "campaign_report.json"))
+    for c_raw in raw_campaigns:
+        c_asins = [str(x).upper() for x in (c_raw.get("creative_asins") or []) if x]
+        c_name = c_raw.get("name") or c_raw.get("campaign_name")
+        if asin and asin in c_asins and c_name:
+            asin_campaigns.add(c_name)
+        if meta.get("portfolio_id") and c_name:
+            asin_campaigns.add(c_name)
+
+    camps = campaign_rows(raw_campaigns)
     if asin_campaigns:
         camps = [c for c in camps if c["name"] in asin_campaigns]
 
@@ -1804,9 +1889,29 @@ def main() -> None:
     if asin_campaigns:
         kws = [r for r in kws if r.get("campaign_name") in asin_campaigns]
 
+    kws_7d_raw = load_json(src / "keywords_7d.json")
+    kws_7d = [r for r in as_rows(kws_7d_raw) if not skip_total(r)] if kws_7d_raw else []
+    if asin_campaigns:
+        kws_7d = [r for r in kws_7d if r.get("campaign_name") in asin_campaigns]
+
+    kws_3d_raw = load_json(src / "keywords_3d.json")
+    kws_3d = [r for r in as_rows(kws_3d_raw) if not skip_total(r)] if kws_3d_raw else []
+    if asin_campaigns:
+        kws_3d = [r for r in kws_3d if r.get("campaign_name") in asin_campaigns]
+
     targets = as_rows(load_json(src / "targets.json"))
     if asin_campaigns:
         targets = [r for r in targets if r.get("campaign_name") in asin_campaigns]
+
+    targets_7d_raw = load_json(src / "targets_7d.json")
+    targets_7d = as_rows(targets_7d_raw) if targets_7d_raw else []
+    if asin_campaigns:
+        targets_7d = [r for r in targets_7d if r.get("campaign_name") in asin_campaigns]
+
+    targets_3d_raw = load_json(src / "targets_3d.json")
+    targets_3d = as_rows(targets_3d_raw) if targets_3d_raw else []
+    if asin_campaigns:
+        targets_3d = [r for r in targets_3d if r.get("campaign_name") in asin_campaigns]
 
     # --------------------------------------------------------------------------
     # Database, Snapshot & Persistent Ledger Execution
@@ -1851,17 +1956,20 @@ def main() -> None:
             "\t".join(str(x) for x in [
                 c["state"], c["targeting"], c["sponsored"], int(c["budget"]),
                 int(c["tos"]), int(c["pp"]), int(c["ros"]),
+                c.get("bidding_strategy", "固定竞价 (Fixed Bids)"),
                 round(c["spend"], 2), round(c["sales"], 2), round(c["acos"], 1),
                 round(c["cpc"], 2), round(c["cpc_7d"], 2), round(c["cpc_3d"], 2),
                 round(c["delta_cpc_pct"], 1), round(c["delta_imp_pct"], 1),
                 round(c["cvr"], 1), round(c["ctr"], 2),
                 int(c["clk"]), int(c["ord"]), int(c["direct_ord"]), int(c["indirect_ord"]),
+                round(c["spend_7d"], 2), round(c["sales_7d"], 2), round(c["acos_7d"], 1), int(c["ord_7d"]), int(c["clk_7d"]), int(c["imp_7d"]),
+                round(c["spend_3d"], 2), round(c["sales_3d"], 2), round(c["acos_3d"], 1), int(c["ord_3d"]), int(c["clk_3d"]), int(c["imp_3d"]),
                 round(c["tos_share"], 2), c["name"],
             ])
         )
     tsv(
         dest / "campaigns.tsv",
-        "state\ttype\tsponsored\tbudget\tTOS\tPP\tROS\tspend_30d\tsales_30d\tacos_30d\tcpc_30d\tcpc_7d\tcpc_3d\tdelta_cpc_pct\tdelta_imp_pct\tcvr_30d\tctr_30d\tclk_30d\tord_30d\tdir\tindir\tshare\tname",
+        "state\ttype\tsponsored\tbudget\tTOS\tPP\tROS\tbidding_strategy\tspend_30d\tsales_30d\tacos_30d\tcpc_30d\tcpc_7d\tcpc_3d\tdelta_cpc_pct\tdelta_imp_pct\tcvr_30d\tctr_30d\tclk_30d\tord_30d\tdir\tindir\tspend_7d\tsales_7d\tacos_7d\tord_7d\tclk_7d\timp_7d\tspend_3d\tsales_3d\tacos_3d\tord_3d\tclk_3d\timp_3d\tshare\tname",
         camp_lines,
     )
 
@@ -1976,7 +2084,7 @@ def main() -> None:
     audit_records, unnegative_adjustments = audit_active_negatives(
         active_neg_dict, profile, rules, sr_map, kws=kws, camps=camps
     )
-    kw_misfit_adjustments = audit_keyword_misfits(kws, rules)
+    kw_misfit_adjustments = audit_keyword_misfits(kws, rules, camps=camps)
 
     bucket_stats = defaultdict(lambda: {"spend": 0.0, "sales": 0.0, "ord": 0.0, "clk": 0.0})
     ngram_stats = defaultdict(lambda: {"spend": 0.0, "sales": 0.0, "ord": 0.0, "clk": 0.0, "queries": set(), "gram_type": "1-gram"})
@@ -1987,18 +2095,77 @@ def main() -> None:
     harvest = []
     bulk_adjustments = []
 
-    # Build lookups for placement fingerprinting
+    # Build 7d and 3d keyword maps for fresh slice analysis
+    kw_7d_map = {}
+    for k in kws_7d:
+        cn = k.get("campaign_name") or ""
+        mt = (k.get("match_type") or "").lower().strip()
+        txt = (k.get("keyword_text") or k.get("targeting_text") or "").strip().lower()
+        if txt:
+            kw_7d_map[(cn, mt, txt)] = k
+
+    kw_3d_map = {}
+    for k in kws_3d:
+        cn = k.get("campaign_name") or ""
+        mt = (k.get("match_type") or "").lower().strip()
+        txt = (k.get("keyword_text") or k.get("targeting_text") or "").strip().lower()
+        if txt:
+            kw_3d_map[(cn, mt, txt)] = k
+
+    # Build lookups for placement fingerprinting and fresh slice verification
     kw_lookup = {}
     for k in kws:
         c_name_k = k.get("campaign_name") or ""
-        text_k = (k.get("keyword_text") or "").lower().strip()
-        match_k = k.get("match_type") or ""
-        if text_k:
-            key_k = f"{c_name_k}::{match_k}::{text_k}"
-            kw_lookup[key_k] = {
-                "bid": num(k.get("bid") or k.get("default_bid")),
-                "cpc": num(k.get("cpc")),
-            }
+        text_k = (k.get("keyword_text") or k.get("targeting_text") or "").strip().lower()
+        match_k = (k.get("match_type") or "").lower().strip()
+        if not text_k:
+            continue
+        key_k = f"{c_name_k}::{match_k}::{text_k}"
+        k7 = kw_7d_map.get((c_name_k, match_k, text_k), {})
+        k3 = kw_3d_map.get((c_name_k, match_k, text_k), {})
+
+        # Current bid: prefer latest report (3d -> 7d -> baseline)
+        current_bid = num(k3.get("bid") or k7.get("bid") or k.get("bid") or k.get("default_bid"))
+        current_state = str(k3.get("state") or k7.get("state") or k.get("state") or "enabled").lower().strip()
+
+        imp_30d = int(num(k.get("impressions")))
+        clk_30d = int(num(k.get("clicks")))
+        spend_30d = num(k.get("cost") or k.get("spend") or k.get("spends"))
+        ord_30d = int(num(k.get("orders")))
+
+        imp_7d = int(num(k7.get("impressions"))) if k7 else 0
+        clk_7d = int(num(k7.get("clicks"))) if k7 else 0
+        spend_7d = num(k7.get("cost") or k7.get("spend") or k7.get("spends")) if k7 else 0.0
+        ord_7d = int(num(k7.get("orders"))) if k7 else 0
+
+        imp_3d = int(num(k3.get("impressions"))) if k3 else 0
+        clk_3d = int(num(k3.get("clicks"))) if k3 else 0
+        spend_3d = num(k3.get("cost") or k3.get("spend") or k3.get("spends")) if k3 else 0.0
+        ord_3d = int(num(k3.get("orders"))) if k3 else 0
+
+        # Zero recent impressions / bleeding halted post adjustment
+        has_zero_recent_traffic = (
+            (imp_3d == 0 and spend_3d == 0.0) and
+            (imp_7d == 0 or spend_7d <= 0.5)
+        ) or (imp_7d == 0 and spend_7d == 0.0)
+
+        # Active recent bleeding requirement for bid reductions
+        has_active_bleeding = (
+            (spend_3d >= 1.5 and ord_3d == 0) or
+            (spend_7d >= 3.0 and ord_7d == 0) or
+            (clk_3d >= 2 and ord_3d == 0)
+        )
+
+        kw_lookup[key_k] = {
+            "bid": current_bid,
+            "cpc": num(k.get("cpc")),
+            "state": current_state,
+            "imp_30d": imp_30d, "clk_30d": clk_30d, "spend_30d": spend_30d, "ord_30d": ord_30d,
+            "imp_7d": imp_7d, "clk_7d": clk_7d, "spend_7d": spend_7d, "ord_7d": ord_7d,
+            "imp_3d": imp_3d, "clk_3d": clk_3d, "spend_3d": spend_3d, "ord_3d": ord_3d,
+            "has_zero_recent_traffic": has_zero_recent_traffic,
+            "has_active_bleeding": has_active_bleeding,
+        }
 
     camp_lookup = {c["name"]: c for c in camps if c.get("name")}
     placement_diagnoses = []
@@ -2077,37 +2244,116 @@ def main() -> None:
             placement_diagnoses.append(diag)
 
         # Search term optimization & placement-based dynamic adjustment
-        is_already_negated = (c_name.lower(), q.lower()) in active_neg_camp_pairs
+        is_already_negated = (c_name.lower(), q.lower()) in active_neg_camp_pairs or any(kn == q.lower() or kn in q.lower() for kn in known_negatives)
 
-        if diag.get("action_type"):
+        if diag.get("action_type") and not is_already_negated:
             action_code = diag["action_type"]
-            if action_code == "Negative_Exact" and is_already_negated:
-                # Already negated in this campaign! Do not recommend negative again.
-                pass
-            elif action_code in ("Elevate_To_TOS", "Throttle_TOS_Bid", "Refine_Bid_Placement", "Lower_Bid", "Negative_Exact"):
-                waste.append(f"{q}\t{c_name}\tspend={spend:.2f}\tclk={int(clk)}\tctr={diag['ctr']}%\tcpc=${diag['cpc']:.2f}\tpos={diag['inferred_placement']}\ttag={diag['strategy_tag']}\taction={action_code}")
-                bulk_adjustments.append({
-                    "action_type": action_code,
-                    "campaign": c_name,
-                    "target_entity": q,
-                    "match_type": "exact" if action_code in ("Elevate_To_TOS", "Throttle_TOS_Bid", "Refine_Bid_Placement") else ("negativeExact" if action_code == "Negative_Exact" else "bid"),
-                    "current_value": f"spend=${spend:.2f}, clk={int(clk)}, ctr={diag['ctr']:.2f}%, cpc=${diag['cpc']:.2f} [{diag['inferred_placement']}]",
-                    "recommended_value": diag["recommended_value"],
-                    "reason": diag["diagnostic_reason"],
-                })
+
+            # Guardrail 1: NEVER output adjustments on paused campaigns!
+            camp_obj = camp_lookup.get(c_name, {})
+            camp_state = camp_obj.get("state", "enabled")
+            if camp_state != "enabled":
+                continue
+
+            matching_kw_matches = [m for m in ("exact", "phrase", "broad") if f"{c_name}::{m}::{q.lower()}" in kw_lookup]
+            is_targeted_kw = bool(matching_kw_matches)
+
+            if is_targeted_kw:
+                actual_match = matching_kw_matches[0]
+                kw_info = kw_lookup[f"{c_name}::{actual_match}::{q.lower()}"]
+                actual_base_bid = kw_info["bid"]
+                kw_state = kw_info["state"]
+
+                # Guardrail 2: Strictly exclude paused keywords!
+                if kw_state != "enabled":
+                    continue
+
+                if action_code in ("Throttle_TOS_Bid", "Lower_Bid"):
+                    # Guardrail 3: Zero Recent Impressions / Bleeding Halted (调后已零曝光·严禁再降)
+                    if kw_info["has_zero_recent_traffic"]:
+                        continue
+
+                    # Guardrail 4: Must have active recent bleeding
+                    if not kw_info["has_active_bleeding"] and kw_info["spend_3d"] == 0.0 and kw_info["spend_7d"] < 2.0:
+                        continue
+
+                    # Guardrail 5: Bid floor protection
+                    if actual_base_bid <= 0.20:
+                        continue
+
+                    new_bid = max(0.18, round(actual_base_bid * 0.75, 2))
+                    waste.append(f"{q}\t{c_name}\tspend={spend:.2f}\tclk={int(clk)}\tctr={diag['ctr']}%\tcpc=${diag['cpc']:.2f}\tpos={diag['inferred_placement']}\ttag={diag['strategy_tag']}\taction={action_code}")
+                    bulk_adjustments.append({
+                        "action_type": "Throttle_TOS_Bid",
+                        "campaign": c_name,
+                        "target_entity": q,
+                        "match_type": actual_match,
+                        "current_value": f"投放词 (当前基础竞价 ${actual_base_bid:.2f}), 30天花费=${spend:.2f}({int(clk)}点击0单), 近3天花费=${kw_info['spend_3d']:.2f}, CPC=${diag['cpc']:.2f} [{diag['inferred_placement']}]",
+                        "recommended_value": f"基础竞价下调 25% 至 ${new_bid:.2f}",
+                        "reason": f"投放关键词在首页顶部黄金位近期仍在活跃流血（近3天花费 ${kw_info['spend_3d']:.2f}），且历史累计 {int(clk)} 次高意图点击仍未转化，下调基础竞价退守防守位避损。",
+                    })
+                elif action_code == "Elevate_To_TOS":
+                    new_bid = round(actual_base_bid * 1.15, 2)
+                    bulk_adjustments.append({
+                        "action_type": "Elevate_To_TOS",
+                        "campaign": c_name,
+                        "target_entity": q,
+                        "match_type": actual_match,
+                        "current_value": f"投放词 (当前基础竞价 ${actual_base_bid:.2f}), 花费=${spend:.2f}, 点击={int(clk)}, CTR={diag['ctr']:.2f}% [{diag['inferred_placement']}]",
+                        "recommended_value": f"基础竞价提高 15% 至 ${new_bid:.2f} 或提升活动 TOS%",
+                        "reason": f"核心投放词在详情页/底部位受抑，提权专打首屏黄金位测试真实转化潜力。",
+                    })
+                elif action_code == "Negative_Exact":
+                    bulk_adjustments.append({
+                        "action_type": "Negative_Exact",
+                        "campaign": c_name,
+                        "target_entity": q,
+                        "match_type": "negativeExact",
+                        "current_value": f"投放词, 花费=${spend:.2f}, 点击={int(clk)}, 0订单",
+                        "recommended_value": f"在活动 {c_name} 添加精准否定 (Negative Exact)",
+                        "reason": diag["diagnostic_reason"],
+                    })
+            else:
+                # q is NOT a targeted keyword in c_name; it is a customer query triggered by broad/auto/phrase
+                if action_code in ("Throttle_TOS_Bid", "Lower_Bid", "Negative_Exact"):
+                    waste.append(f"{q}\t{c_name}\tspend={spend:.2f}\tclk={int(clk)}\tctr={diag['ctr']}%\tcpc=${diag['cpc']:.2f}\tpos={diag['inferred_placement']}\ttag={diag['strategy_tag']}\taction=Negative_Exact")
+                    bulk_adjustments.append({
+                        "action_type": "Negative_Exact",
+                        "campaign": c_name,
+                        "target_entity": q,
+                        "match_type": "negativeExact",
+                        "current_value": f"买家搜索词 (触发投放词: {target_text} [{match_type}]), 花费=${spend:.2f}, 点击={int(clk)}, 0订单 [{diag['inferred_placement']}]",
+                        "recommended_value": f"在活动 {c_name} 添加精准否定 (Negative Exact)",
+                        "reason": f"买家搜索词由广泛/自动投放词匹配触发，非独立投放词，无法直接调竞价；在首屏顶部已高耗损未转化，应在活动 {c_name} 中精准否定以阻断流血。",
+                    })
+                elif action_code in ("Elevate_To_TOS", "Refine_Bid_Placement"):
+                    harvest_camp = find_exact_harvest_campaign(camps, kws)
+                    harvest_camp_obj = camp_lookup.get(harvest_camp, {})
+                    if harvest_camp_obj.get("state") == "enabled":
+                        bulk_adjustments.append({
+                            "action_type": "Harvest_To_Exact",
+                            "campaign": c_name,
+                            "target_entity": q,
+                            "match_type": "exact",
+                            "current_value": f"买家搜索词 (触发投放词: {target_text} [{match_type}]), 花费=${spend:.2f}, 点击={int(clk)}, CTR={diag['ctr']:.2f}% [{diag['inferred_placement']}]",
+                            "recommended_value": f"在原活动精准否定防内耗，移入专用精准仓 ({harvest_camp}) 独立出价测试首屏",
+                            "reason": f"优质买家搜索词在广泛仓被困在低效展示位，无法单独为其加价；应移入精准仓独立控制基础竞价与溢价专打顶部，并在广泛仓精准否定防内耗。",
+                        })
 
         # High-potential winning query (harvest)
         if ordn >= 5 and acos(spend, sales) <= target_acos and spend >= 12:
-            harvest.append(f"{q}\t{c_name}\tspend={spend:.2f}\tacos={acos(spend,sales):.1f}\tord={int(ordn)}\tbucket={bucket}\ttier={v_tier}")
-            bulk_adjustments.append({
-                "action_type": "Harvest_Exact",
-                "campaign": c_name,
-                "target_entity": q,
-                "match_type": "exact",
-                "current_value": f"orders={int(ordn)}, acos={acos(spend,sales):.1f}%",
-                "recommended_value": "Promote to Dedicated Exact Campaign",
-                "reason": f"Proven conversion engine (orders={int(ordn)}, acos={acos(spend,sales):.1f}% <= target {target_acos:.0f}%), bucket: {bucket}, tier: {v_tier}",
-            })
+            camp_obj = camp_lookup.get(c_name, {})
+            if camp_obj.get("state") == "enabled":
+                harvest.append(f"{q}\t{c_name}\tspend={spend:.2f}\tacos={acos(spend,sales):.1f}\tord={int(ordn)}\tbucket={bucket}\ttier={v_tier}")
+                bulk_adjustments.append({
+                    "action_type": "Harvest_Exact",
+                    "campaign": c_name,
+                    "target_entity": q,
+                    "match_type": "exact",
+                    "current_value": f"orders={int(ordn)}, acos={acos(spend,sales):.1f}%",
+                    "recommended_value": "Promote to Dedicated Exact Campaign",
+                    "reason": f"Proven conversion engine (orders={int(ordn)}, acos={acos(spend,sales):.1f}% <= target {target_acos:.0f}%), bucket: {bucket}, tier: {v_tier}",
+                })
 
     tsv(
         dest / "search_terms.tsv",
@@ -2190,9 +2436,10 @@ def main() -> None:
                 bleeding_ng.append(f"{ng}\tspend=${sp:.2f}\tclk={int(ck)}\tqueries_count={len(stat['queries'])}\ttype={stat['gram_type']}\tPROTECTED(strong_query_overlap)")
                 continue
 
-            # Deduplication: Check if this root phrase is already negated or all its queries are already negated
+            # Deduplication: Check if this root phrase is already negated or in known_negatives
             all_queries_negated = all(q_item.lower() in all_neg_queries for q_item in stat["queries"])
-            if ng.lower() in all_neg_queries or all_queries_negated:
+            is_known_neg = ng.lower() in known_negatives or any(kn == ng.lower() or kn in ng.lower() for kn in known_negatives)
+            if ng.lower() in all_neg_queries or all_queries_negated or is_known_neg:
                 bleeding_ng.append(f"{ng}\tspend=${sp:.2f}\tclk={int(ck)}\tqueries_count={len(stat['queries'])}\ttype={stat['gram_type']}\tALREADY_NEGATED")
                 continue
 
@@ -2287,15 +2534,19 @@ def main() -> None:
             action_code, rec_val, reason_text = evaluate_competitor_target(c_info, profile, target_acos)
             comp_eval = action_code
             if action_code in ("Negative_Target", "Lower_Bid", "Harvest_ASIN"):
-                bulk_adjustments.append({
-                    "action_type": action_code,
-                    "campaign": c_info["campaign_name"],
-                    "target_entity": c_info["asin"],
-                    "match_type": "asinSameAs",
-                    "current_value": f"spend=${c_info['spend']:.2f}, ord={c_info['orders']}, comp_price=${c_info['price']:.2f} vs our=${profile.get('price')}",
-                    "recommended_value": rec_val,
-                    "reason": reason_text,
-                })
+                c_name_t = c_info["campaign_name"]
+                t_state = str(r.get("state") or "enabled").lower().strip()
+                camp_state_t = camp_lookup.get(c_name_t, {}).get("state", "enabled")
+                if camp_state_t == "enabled" and t_state == "enabled":
+                    bulk_adjustments.append({
+                        "action_type": action_code,
+                        "campaign": c_info["campaign_name"],
+                        "target_entity": c_info["asin"],
+                        "match_type": "asinSameAs",
+                        "current_value": f"spend=${c_info['spend']:.2f}, ord={c_info['orders']}, comp_price=${c_info['price']:.2f} vs our=${profile.get('price')}",
+                        "recommended_value": rec_val,
+                        "reason": reason_text,
+                    })
         t_lines.append("\t".join(str(x) for x in [
             r.get("campaign_name"), r.get("exp_type_zh") or r.get("exp_type_text") or r.get("match_type"),
             r.get("targeting_text") or r.get("expression") or r.get("keyword_text"),
@@ -2562,6 +2813,7 @@ def main() -> None:
     total_spend = sum(c["spend"] for c in camps)
     total_sales = sum(c["sales"] for c in camps)
     total_ord = sum(c["ord"] for c in camps)
+    total_clk = sum(c["clk"] for c in camps)
     effective_adj_count = sum(1 for x in ledger if "见效" in str(x.get("effect_verdict", "")))
     shock_adj_count = sum(1 for x in ledger if "休克" in str(x.get("effect_verdict", "")))
     bleed_adj_count = sum(1 for x in ledger if "失血" in str(x.get("effect_verdict", "")))
@@ -2573,7 +2825,45 @@ def main() -> None:
     summary.append(f"price/stars/reviews\t{profile.get('price')}\t{profile.get('stars')}\t{profile.get('reviews')}")
     summary.append(f"small_rank\t{profile.get('small_rank')}")
     summary.append(f"stock\tfulfillable={profile.get('fulfillable')}\tdos={profile.get('days_of_supply')}")
-    summary.append(f"portfolio_like_totals\tspend={total_spend:.2f}\tsales={total_sales:.2f}\tacos={acos(total_spend,total_sales):.1f}\tord={int(total_ord)}")
+    # 7d and 3d totals
+    total_cpc = (total_spend / total_clk) if total_clk > 0 else 0.0
+    total_spend_7d = sum(c.get("spend_7d", 0.0) for c in camps)
+    total_sales_7d = sum(c.get("sales_7d", 0.0) for c in camps)
+    total_ord_7d = sum(c.get("ord_7d", 0) for c in camps)
+    total_clk_7d = sum(c.get("clk_7d", 0) for c in camps)
+    total_cpc_7d = (total_spend_7d / total_clk_7d) if total_clk_7d > 0 else 0.0
+
+    total_spend_3d = sum(c.get("spend_3d", 0.0) for c in camps)
+    total_sales_3d = sum(c.get("sales_3d", 0.0) for c in camps)
+    total_ord_3d = sum(c.get("ord_3d", 0) for c in camps)
+    total_clk_3d = sum(c.get("clk_3d", 0) for c in camps)
+    total_cpc_3d = (total_spend_3d / total_clk_3d) if total_clk_3d > 0 else 0.0
+
+    # Enabled-only totals
+    en_spend_30d = sum(c.get("spend", 0.0) for c in enabled)
+    en_sales_30d = sum(c.get("sales", 0.0) for c in enabled)
+    en_ord_30d = sum(c.get("ord", 0) for c in enabled)
+    en_clk_30d = sum(c.get("clk", 0) for c in enabled)
+    en_cpc_30d = (en_spend_30d / en_clk_30d) if en_clk_30d > 0 else 0.0
+
+    en_spend_7d = sum(c.get("spend_7d", 0.0) for c in enabled)
+    en_sales_7d = sum(c.get("sales_7d", 0.0) for c in enabled)
+    en_ord_7d = sum(c.get("ord_7d", 0) for c in enabled)
+    en_clk_7d = sum(c.get("clk_7d", 0) for c in enabled)
+    en_cpc_7d = (en_spend_7d / en_clk_7d) if en_clk_7d > 0 else 0.0
+
+    en_spend_3d = sum(c.get("spend_3d", 0.0) for c in enabled)
+    en_sales_3d = sum(c.get("sales_3d", 0.0) for c in enabled)
+    en_ord_3d = sum(c.get("ord_3d", 0) for c in enabled)
+    en_clk_3d = sum(c.get("clk_3d", 0) for c in enabled)
+    en_cpc_3d = (en_spend_3d / en_clk_3d) if en_clk_3d > 0 else 0.0
+
+    summary.append(f"portfolio_totals_30d_all\tspend={total_spend:.2f}\tsales={total_sales:.2f}\tacos={acos(total_spend,total_sales):.2f}%\tord={int(total_ord)}\tcpc={total_cpc:.2f}")
+    summary.append(f"portfolio_totals_30d_enabled\tspend={en_spend_30d:.2f}\tsales={en_sales_30d:.2f}\tacos={acos(en_spend_30d,en_sales_30d):.2f}%\tord={int(en_ord_30d)}\tcpc={en_cpc_30d:.2f}")
+    summary.append(f"portfolio_totals_7d_all\tspend={total_spend_7d:.2f}\tsales={total_sales_7d:.2f}\tacos={acos(total_spend_7d,total_sales_7d):.2f}%\tord={int(total_ord_7d)}\tcpc={total_cpc_7d:.2f}")
+    summary.append(f"portfolio_totals_7d_enabled\tspend={en_spend_7d:.2f}\tsales={en_sales_7d:.2f}\tacos={acos(en_spend_7d,en_sales_7d):.2f}%\tord={int(en_ord_7d)}\tcpc={en_cpc_7d:.2f}")
+    summary.append(f"portfolio_totals_3d_all\tspend={total_spend_3d:.2f}\tsales={total_sales_3d:.2f}\tacos={acos(total_spend_3d,total_sales_3d):.2f}%\tord={int(total_ord_3d)}\tcpc={total_cpc_3d:.2f}")
+    summary.append(f"portfolio_totals_3d_enabled\tspend={en_spend_3d:.2f}\tsales={en_sales_3d:.2f}\tacos={acos(en_spend_3d,en_sales_3d):.2f}%\tord={int(en_ord_3d)}\tcpc={en_cpc_3d:.2f}")
     summary.append(f"enabled_campaigns\t{len(enabled)} / {len(camps)}")
     summary.append(f"asin_campaigns_filtered\t{len(asin_campaigns)}")
     high_tos = [c["name"] for c in enabled if c["tos"] >= 180]

@@ -150,8 +150,17 @@ def search(tool_id: str) -> Any:
     return call_tool("search", {"toolId": tool_id})
 
 
+_searched_tools: set[str] = set()
+
+
 def action(tool_id: str, params: dict | None = None) -> Any:
-    return call_tool("action", {"toolId": tool_id, "params": params or {}})
+    res = call_tool("action", {"toolId": tool_id, "params": params or {}})
+    raw_str = str(res)
+    if ("status: 422" in raw_str or "422" in str(res.get("msg", "")) or "工具参数" in raw_str) and tool_id not in _searched_tools:
+        search(tool_id)
+        _searched_tools.add(tool_id)
+        res = call_tool("action", {"toolId": tool_id, "params": params or {}})
+    return res
 
 
 def unwrap(obj: Any) -> Any:

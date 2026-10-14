@@ -11,5 +11,8 @@ snapshots/
 .env
 .env.*
 *.log
+*.patch
+*.diff
+scratch/
 .DS_Store
 Thumbs.db
