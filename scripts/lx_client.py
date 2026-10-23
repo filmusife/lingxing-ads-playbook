@@ -5,7 +5,8 @@ from __future__ import annotations
 
 import json
 import os
-import tomllib
+import threading
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -26,7 +27,7 @@ def _gemini_home() -> Path:
     return Path(os.environ.get("GEMINI_HOME") or (Path.home() / ".gemini"))
 
 
-def load_mcp_config() -> dict[str, str]:
+def _resolve_mcp_config() -> dict[str, str]:
     # 1. Check environment variables
     url = os.environ.get("LINGXING_MCP_URL") or DEFAULT_URL
     key = os.environ.get("LINGXING_MCP_KEY") or ""
@@ -66,47 +67,83 @@ def load_mcp_config() -> dict[str, str]:
             except Exception:
                 pass
 
-    # 3. Check Codex config.toml
+    # 3. Check Codex config.toml. tomllib is stdlib only on Python 3.11+, so this
+    #    source is optional -- never let it break the env-var or Gemini paths above.
     cfg_path = _codex_home() / "config.toml"
     if cfg_path.exists():
         try:
-            with cfg_path.open("rb") as f:
-                cfg = tomllib.load(f)
-            server = (cfg.get("mcp_servers") or {}).get("lingxing-mcp") or {}
-            url = server.get("url") or url
-            headers = server.get("http_headers") or {}
-            key = headers.get("X-Mcp-Key") or headers.get("x-mcp-key") or key
-            if key:
-                return {"url": url, "key": key}
-        except Exception:
-            pass
+            import tomllib
+        except ModuleNotFoundError:
+            tomllib = None
+        if tomllib is not None:
+            try:
+                with cfg_path.open("rb") as f:
+                    cfg = tomllib.load(f)
+                server = (cfg.get("mcp_servers") or {}).get("lingxing-mcp") or {}
+                url = server.get("url") or url
+                headers = server.get("http_headers") or {}
+                key = headers.get("X-Mcp-Key") or headers.get("x-mcp-key") or key
+                if key:
+                    return {"url": url, "key": key}
+            except Exception:
+                pass
 
     raise LingxingError(
         "Missing Lingxing MCP key. Please configure it via one of:\n"
         "1. Environment variable: set LINGXING_MCP_KEY=<your_key>\n"
         "2. Antigravity: add to ~/.gemini/config/mcp_config.json under mcpServers.lingxing-mcp.headers.X-Mcp-Key\n"
-        "3. Codex: add to ~/.codex/config.toml under [mcp_servers.lingxing-mcp.http_headers] X-Mcp-Key"
+        "3. Codex: add to ~/.codex/config.toml under [mcp_servers.lingxing-mcp.http_headers] X-Mcp-Key\n"
+        "   (requires Python 3.11+ for TOML support)"
     )
 
 
-def rpc(method: str, params: dict | None = None, timeout: int = 120) -> dict[str, Any]:
+_config_cache: dict[str, str] | None = None
+_config_lock = threading.Lock()
+
+
+def load_mcp_config() -> dict[str, str]:
+    """Resolve the MCP endpoint once and reuse it for every subsequent RPC."""
+    global _config_cache
+    if _config_cache is None:
+        with _config_lock:
+            if _config_cache is None:
+                _config_cache = _resolve_mcp_config()
+    return _config_cache
+
+
+def rpc(method: str, params: dict | None = None, timeout: int = 120, max_retries: int = 3) -> dict[str, Any]:
     cfg = load_mcp_config()
     payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params or {}}
-    req = urllib.request.Request(
-        cfg["url"],
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers={
-            "X-Mcp-Key": cfg["key"],
-            "Accept": "application/json, text/event-stream",
-            "Content-Type": "application/json; charset=utf-8",
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            body = resp.read().decode("utf-8")
-    except urllib.error.HTTPError as exc:
-        raise LingxingError(f"HTTP {exc.code} calling {method}") from exc
+    req_data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    headers = {
+        "X-Mcp-Key": cfg["key"],
+        "Accept": "application/json, text/event-stream",
+        "Content-Type": "application/json; charset=utf-8",
+    }
+    
+    last_err = None
+    for attempt in range(max_retries):
+        req = urllib.request.Request(
+            cfg["url"],
+            data=req_data,
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                body = resp.read().decode("utf-8")
+            break
+        except (urllib.error.URLError, ConnectionError, TimeoutError, OSError) as exc:
+            last_err = exc
+            if attempt < max_retries - 1:
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            if isinstance(exc, urllib.error.HTTPError):
+                raise LingxingError(f"HTTP {exc.code} calling {method}") from exc
+            raise LingxingError(f"Network error calling {method}: {exc}") from exc
+    else:
+        raise LingxingError(f"Failed calling {method} after {max_retries} attempts: {last_err}")
+
     try:
         obj = json.loads(body)
     except json.JSONDecodeError as exc:
@@ -151,16 +188,28 @@ def search(tool_id: str) -> Any:
 
 
 _searched_tools: set[str] = set()
+_searched_lock = threading.Lock()
+
+
+def _needs_schema_refresh(res: Any) -> bool:
+    """A 422 means the server rejected our params; re-fetching the tool schema may fix it."""
+    msg = res.get("msg", "") if isinstance(res, dict) else ""
+    raw_str = str(res)
+    return "status: 422" in raw_str or "422" in str(msg) or "工具参数" in raw_str
 
 
 def action(tool_id: str, params: dict | None = None) -> Any:
     res = call_tool("action", {"toolId": tool_id, "params": params or {}})
-    raw_str = str(res)
-    if ("status: 422" in raw_str or "422" in str(res.get("msg", "")) or "工具参数" in raw_str) and tool_id not in _searched_tools:
-        search(tool_id)
-        _searched_tools.add(tool_id)
-        res = call_tool("action", {"toolId": tool_id, "params": params or {}})
-    return res
+    if not _needs_schema_refresh(res):
+        return res
+    with _searched_lock:
+        already_searched = tool_id in _searched_tools
+        if not already_searched:
+            _searched_tools.add(tool_id)
+    if already_searched:
+        return res
+    search(tool_id)
+    return call_tool("action", {"toolId": tool_id, "params": params or {}})
 
 
 def unwrap(obj: Any) -> Any:
@@ -194,10 +243,35 @@ def rows(obj: Any) -> list[dict]:
     return []
 
 
+def _declared_total(payload: Any) -> int | None:
+    """Pull the server's row count out of a response so pagination can stop early."""
+    cur = payload
+    for _ in range(4):
+        if not isinstance(cur, dict):
+            return None
+        for key in ("total", "total_count", "totalCount", "total_size", "count"):
+            val = cur.get(key)
+            if isinstance(val, bool):
+                continue
+            if isinstance(val, int) and val >= 0:
+                return val
+            if isinstance(val, str) and val.isdigit():
+                return int(val)
+        cur = cur.get("data")
+    return None
+
+
 def paginate(tool_id: str, base_params: dict, page_key: str = "page", start: int = 1, max_pages: int = 20) -> list[dict]:
     all_rows: list[dict] = []
+    try:
+        length = int(base_params.get("length") or base_params.get("page_size") or base_params.get("limit") or 100)
+    except (TypeError, ValueError):
+        length = 100
+    if length <= 0:
+        length = 100
+
     page = start
-    while page <= max_pages:
+    while page < start + max_pages:
         params = dict(base_params)
         params[page_key] = page
         payload = action(tool_id, params)
@@ -205,11 +279,12 @@ def paginate(tool_id: str, base_params: dict, page_key: str = "page", start: int
         if not chunk:
             break
         all_rows.extend(chunk)
-        try:
-            length = int(params.get("length") or params.get("page_size") or params.get("limit") or 100)
-        except (TypeError, ValueError):
-            length = 100
         if len(chunk) < length:
+            break
+        # Stop without burning a round trip on an empty final page when the
+        # server told us how many rows exist in total.
+        total = _declared_total(payload)
+        if total is not None and len(all_rows) >= total:
             break
         page += 1
     return all_rows

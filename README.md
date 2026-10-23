@@ -118,6 +118,7 @@ python scripts/analyze_ads_bundle.py --indir work/lx-ads --outdir work/lx-ads/an
 - `--portfolio <PORTFOLIO_ID_OR_NAME>`：筛选指定广告组合
 - `--target-acos <FLOAT>`：手动指定目标 ACOS 阈值（默认自动基于保本 ACOS 的 68% 科学锚定）
 - `--rules <PATH>`：自定义精准产品特征分桶规则（参考 `references/product-rules-template.json`）
+- `--concurrency <N>`：并行拉取报表的线程数（默认 6；接口限流时设为 1 退回串行）
 - `--known-negatives <PATH_OR_LIST>`：指定已否定词列表或文件路径，防止重复推荐已知否定词
 
 ---
@@ -126,7 +127,7 @@ python scripts/analyze_ads_bundle.py --indir work/lx-ads --outdir work/lx-ads/an
 
 ```
 lingxing-ads-playbook/
-├── SKILL.md                          # 24 条一线操盘核心铁律与端到端标准化流程
+├── SKILL.md                          # 44 条一线操盘核心铁律与端到端标准化流程
 ├── README.md                         # 仓库说明与部署使用指南
 ├── agents/
 │   └── openai.yaml                   # MCP 工具依赖与代理声明
@@ -139,7 +140,8 @@ lingxing-ads-playbook/
 └── scripts/
     ├── fetch_ads_bundle.py           # 多窗口切片取数与元数据档案生成
     ├── analyze_ads_bundle.py         # 智能分析引擎（差分、熔断、ABA、溢价、持久化账本）
-    └── lx_client.py                  # 健壮的轻量级 JSON-RPC 客户端（无原生 MCP 工具时自动回退）
+    ├── lx_client.py                  # 健壮的轻量级 JSON-RPC 客户端（无原生 MCP 工具时自动回退）
+    └── xydc_client.py                # 西柚洞察（xydc-mcp）自然排名与广告位双轨排名客户端
 ```
 
 ---

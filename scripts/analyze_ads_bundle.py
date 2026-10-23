@@ -17,9 +17,13 @@ from __future__ import annotations
 import argparse
 import json
 import re
-from collections import defaultdict
+import sys
+from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from lx_client import rows as lx_rows
 
 
 STOP_WORDS = {
@@ -40,31 +44,8 @@ STOP_WORDS = {
 
 
 def as_rows(obj):
-    if obj is None:
-        return []
-    if isinstance(obj, list):
-        return [x for x in obj if isinstance(x, dict)]
-    if not isinstance(obj, dict):
-        return []
-    cur = obj
-    for _ in range(6):
-        if isinstance(cur, list):
-            return [x for x in cur if isinstance(x, dict)]
-        if not isinstance(cur, dict):
-            return []
-        if isinstance(cur.get("list"), list):
-            return [x for x in cur["list"] if isinstance(x, dict)]
-        data = cur.get("data")
-        if isinstance(data, list):
-            return [x for x in data if isinstance(x, dict)]
-        if isinstance(data, dict):
-            cur = data
-            continue
-        for key in ("records", "rows", "items"):
-            if isinstance(cur.get(key), list):
-                return [x for x in cur[key] if isinstance(x, dict)]
-        return []
-    return []
+    """Pull the row list out of a Lingxing payload, whatever wrapper depth it arrived in."""
+    return lx_rows(obj)
 
 
 def load_json(path: Path):
@@ -168,10 +149,29 @@ def load_traffic_profile(indir: Path) -> dict:
     total_sessions = int(num(r.get("sessions_total") or r.get("sessions")))
     total_pageviews = int(num(r.get("page_views_total") or r.get("page_views")))
     ad_cvr = round(num(r.get("ad_cvr")) * 100, 2)
-    nature_cvr = round(num(r.get("nature_cvr")) * 100, 2)
+    nature_cvr_raw = round(num(r.get("nature_cvr")) * 100, 2)
+    nature_cvr = max(0.0, nature_cvr_raw)
     total_cvr = round(num(r.get("cvr")) * 100, 2)
     adv_rate = round(num(r.get("adv_rate")) * 100, 2)
     tacos = round(num(r.get("acoas")) * 100, 2)
+    # Assess Listing Organic Readiness Index (Rule 27)
+    if nature_cvr <= 1.0 or adv_rate >= 90.0:
+        organic_readiness = "ORGANIC_FRAGILE"
+        organic_guidance = (
+            "Listing 自然承接力脆弱（纯广告依赖型）：自然位缓冲厚度极薄，"
+            "严禁执行全账户多活动同步大砍 TOS 与竞价的双重抑制（Double-Damping），"
+            "必须执行单变量阶梯式微降（每次下调 TOS <= 25%），并将预算向细分具体卖点词转移，严防大盘失速休克！"
+        )
+    elif nature_cvr >= 5.0 and adv_rate <= 75.0:
+        organic_readiness = "ORGANIC_FLYWHEEL"
+        organic_guidance = (
+            "Listing 具备成熟自然搜索飞轮（自然转化良好/BSR靠前）："
+            "果断拉平畸形 TOS，清洗外围泛流，集中兵力于核心精准仓，可安全释放自然位扩展红利。"
+        )
+    else:
+        organic_readiness = "ORGANIC_BALANCED"
+        organic_guidance = "Listing 处于标准稳态演进期，按标准单变量阶梯调控执行。"
+
     return {
         "sessions_total": total_sessions,
         "page_views_total": total_pageviews,
@@ -179,11 +179,15 @@ def load_traffic_profile(indir: Path) -> dict:
         "page_views_mobile": int(num(r.get("page_views_mobile"))),
         "ad_cvr": ad_cvr,
         "nature_cvr": nature_cvr,
+        "nature_cvr_raw": nature_cvr_raw,
         "total_cvr": total_cvr,
         "adv_sales_share": adv_rate,
+        "attribution_lag": adv_rate > 100.0 or nature_cvr_raw < 0,
         "tacos": tacos,
         "return_goods_rate": round(num(r.get("return_goods_rate")) * 100, 2),
         "cvr_ad_vs_nature_ratio": round(ad_cvr / nature_cvr, 2) if nature_cvr > 0 else 0.0,
+        "organic_readiness": organic_readiness,
+        "organic_guidance": organic_guidance,
     }
 
 
@@ -191,22 +195,58 @@ def load_dayparting_analysis(indir: Path) -> tuple[list[dict], list[str]]:
     h_rows = as_rows(load_json(indir / "order_analysis_hourly.json"))
     table_lines = []
     hourly_records = []
+    parsed_rows = []
     for r in h_rows:
         k = str(r.get("key"))
         if k == "sub_total" or not k.isdigit():
             continue
-        hr = int(k)
-        sp = num(r.get("spend"))
-        ad_ord = int(num(r.get("ad_orders")))
-        st_ord = int(num(r.get("store_orders")))
-        cvr_v = num(r.get("cvr"))
-        acos_v = num(r.get("acos"))
-        cpc_v = num(r.get("cpc"))
+        parsed_rows.append({
+            "hr": int(k),
+            "sp": num(r.get("spend")),
+            "ad_ord": int(num(r.get("ad_orders"))),
+            "st_ord": int(num(r.get("store_orders"))),
+            "cvr_v": num(r.get("cvr")),
+            "acos_v": num(r.get("acos")),
+            "cpc_v": num(r.get("cpc")),
+        })
 
-        if cvr_v >= 15.0 and acos_v <= 18.0:
+    # Adaptive baseline benchmarks based on the ASIN's actual hourly distribution
+    active_hours = [x for x in parsed_rows if x["sp"] > 0 or x["ad_ord"] > 0]
+    if active_hours:
+        avg_cvr = sum(x["cvr_v"] for x in active_hours) / len(active_hours)
+        valid_acos = [x["acos_v"] for x in active_hours if x["acos_v"] > 0]
+        avg_acos = (sum(valid_acos) / len(valid_acos)) if valid_acos else 30.0
+        avg_ord = sum(x["ad_ord"] for x in active_hours) / len(active_hours)
+    else:
+        avg_cvr, avg_acos, avg_ord = 2.5, 30.0, 3.0
+
+    for item in parsed_rows:
+        hr = item["hr"]
+        sp = item["sp"]
+        ad_ord = item["ad_ord"]
+        st_ord = item["st_ord"]
+        cvr_v = item["cvr_v"]
+        acos_v = item["acos_v"]
+        cpc_v = item["cpc_v"]
+
+        # 1. Peak hour: High orders or superior CVR with controlled ACOS
+        is_peak = (
+            (ad_ord >= max(5, avg_ord * 1.3) and acos_v <= max(28.0, avg_acos * 0.95))
+            or (cvr_v >= max(2.8, avg_cvr * 1.25) and acos_v <= max(25.0, avg_acos * 0.85) and ad_ord >= 3)
+            or (ad_ord >= 8 and acos_v <= max(35.0, avg_acos * 1.1))
+        )
+
+        # 2. Bleeding hour: Zero orders with spend, or blown out ACOS, or dismal CVR with high spend
+        is_bleeding = (
+            (sp >= 10.0 and ad_ord == 0)
+            or (acos_v >= max(50.0, avg_acos * 1.4) and sp >= 15.0)
+            or (cvr_v <= min(1.2, avg_cvr * 0.5) and sp >= 20.0 and acos_v >= 40.0)
+        )
+
+        if is_peak and not is_bleeding:
             classification = "PEAK_GOLDEN_HOUR"
             dayparting_adj = "Boost budget/bid +15%~+25%"
-        elif acos_v >= 24.0 or cvr_v <= 11.0:
+        elif is_bleeding and not is_peak:
             classification = "BLEEDING_OFFPEAK_HOUR"
             dayparting_adj = "Throttle bid -20%~-30%"
         else:
@@ -444,6 +484,203 @@ def get_searchrank(term: str, sr_map: dict[str, int]) -> tuple[int | None, str]:
     return sr, "LONG_TAIL"           # 长尾细分词
 
 
+def load_xydc_ranks(src: Path) -> dict[str, dict]:
+    """Load keyword organic & sponsored ranks from xydc_ranks.json (西柚洞察)."""
+    p = src / "xydc_ranks.json"
+    if not p.exists():
+        return {}
+    data = load_json(p)
+    if not data or not isinstance(data, dict):
+        return {}
+    ranks_map = {}
+    for kw, item in data.items():
+        if not isinstance(item, dict):
+            continue
+        kw_clean = str(kw).lower().strip()
+        ranks_map[kw_clean] = {
+            "search_term": item.get("search_term") or kw_clean,
+            "organic_rank": item.get("organic_rank"),
+            "organic_page": item.get("organic_page"),
+            "sp_rank": item.get("sp_rank"),
+            "sp_page": item.get("sp_page"),
+            "sb_rank": item.get("sb_rank"),
+            "organic_traffic": num(item.get("organic_traffic")),
+            "ad_traffic": num(item.get("ad_traffic")),
+            "total_traffic": num(item.get("total_traffic")),
+            "organic_rate": num(item.get("organic_rate")),
+            "ad_rate": num(item.get("ad_rate")),
+            "organic_growth": num(item.get("organic_growth")),
+            "ad_growth": num(item.get("ad_growth")),
+        }
+    return ranks_map
+
+
+def evaluate_rank_synergy(
+    term: str,
+    xydc_map: dict[str, dict],
+    spend: float = 0.0,
+    sales: float = 0.0,
+    orders: int = 0,
+    clicks: int = 0,
+    target_acos: float = 25.0,
+    current_bid: float = 0.0,
+) -> dict:
+    """Evaluate organic rank vs sponsored rank synergy under Rule 38.
+    
+    Categorizes keyword into 5 strategic tiers and determines exact bidding / TOS actions:
+    - Tier 1: 王者双霸屏 vs 防内耗控价 (Organic Rank 1-3)
+    - Tier 2: 临界冲刺期 (Flywheel Ascender, Organic Rank 4-15)
+    - Tier 3: 腰部攻坚期 (Mid Breakthrough, Organic Rank 16-50)
+    - Tier 4: 自然脱节/远距离 (Organic Disconnect, Organic Rank > 50 or unranked)
+    - Tier 5: 暂无排名数据 (Unranked)
+    """
+    t = (term or "").lower().strip()
+    info = xydc_map.get(t)
+    if not info:
+        t_sub = re.sub(r"[^\w\s]", "", t).strip()
+        info = xydc_map.get(t_sub)
+
+    if not info:
+        return {
+            "organic_rank": None,
+            "sp_rank": None,
+            "organic_traffic": 0.0,
+            "ad_traffic": 0.0,
+            "total_traffic": 0.0,
+            "organic_rate": 0.0,
+            "ad_rate": 0.0,
+            "synergy_tier": "Tier 5: 暂无排名",
+            "synergy_tag": "【未建自然权重】",
+            "action_type": "",
+            "recommended_value": "",
+            "reason": "西柚洞察未收录该词自然/广告排名数据，按常规广告绩效调整",
+        }
+
+    org_rank = info.get("organic_rank")
+    sp_rank = info.get("sp_rank")
+    org_traffic = info.get("organic_traffic", 0.0)
+    ad_traffic = info.get("ad_traffic", 0.0)
+    tot_traffic = info.get("total_traffic", 0.0)
+    org_rate = info.get("organic_rate", 0.0)
+    ad_rate = info.get("ad_rate", 0.0)
+    actual_acos = acos(spend, sales)
+
+    action_type = ""
+    recom = ""
+    reason = ""
+
+    # Tier 1: Organic Rank 1 ~ 3
+    if org_rank is not None and org_rank <= 3:
+        if org_rank == 1:
+            # Scenario A: Healthy conversion -> Defensive Dominance
+            if orders > 0 and actual_acos <= (target_acos * 1.15):
+                tier = "Tier 1: 王者双霸屏"
+                tag = "【自然#1·双霸屏稳流】"
+                action_type = "Defensive_Dominance_Maintain"
+                recom = "保持基础竞价，锁定 TOS 溢价 30%-50% 防竞品夺位"
+                reason = f"自然排名高居全网第 1 名，且广告 ACOS {actual_acos:.1f}% 处于健康受控区间。SP 广告与自然位形成双霸屏，封锁首屏 60% 视觉流量。坚决不盲目关停或大降出价，防止竞品顶位分流导致总单量与自然权坠落。"
+            # Scenario B: High ACOS or zero-conversion spend -> Cannibalization Throttle
+            elif actual_acos > (target_acos * 1.2) or (spend >= 15.0 and orders == 0):
+                tier = "Tier 1: 防内耗控价"
+                tag = "【自然#1·防内耗控价】"
+                action_type = "Throttle_Cannibalization_Bid"
+                new_bid = max(0.25, round((current_bid or 0.40) * 0.82, 2))
+                recom = f"基础竞价下调 18% 至 ${new_bid:.2f}，TOS 溢价压至 25%-30%"
+                reason = f"自然排名已高居第 1 名，但广告 ACOS {actual_acos:.1f}% 严重超标。下调基础竞价避免付费点击侵蚀原本属于自然位的免费订单，释放净利润；启动 3-5 天总订单量熔断监控（总单跌幅≥15%即回提）。"
+            else:
+                tier = "Tier 1: 头部观察"
+                tag = "【自然#1·头部观察】"
+                recom = "维持当前竞价与展示，观察增量贡献"
+                reason = f"自然排名第 1，当前广告花费较低（${spend:.2f}），维持低成本观察。"
+        else: # org_rank in (2, 3)
+            if actual_acos <= (target_acos * 1.2):
+                tier = "Tier 1: 前三霸屏"
+                tag = f"【自然#{org_rank}·保位霸屏】"
+                action_type = "Defensive_Dominance_Maintain"
+                recom = "维持基础竞价，TOS 溢价 40%-60% 压制竞品"
+                reason = f"自然位在第 {org_rank} 位，处于黄金收获期。保持 SP 广告在前 3 位，协同自然位压制竞品，巩固护城河。"
+            else:
+                tier = "Tier 1: 防内耗控价"
+                tag = f"【自然#{org_rank}·微调避耗】"
+                action_type = "Throttle_Cannibalization_Bid"
+                new_bid = max(0.25, round((current_bid or 0.40) * 0.85, 2))
+                recom = f"基础竞价微调 15% 至 ${new_bid:.2f}，降低 TOS 溢价"
+                reason = f"自然位第 {org_rank} 位，但广告 ACOS {actual_acos:.1f}% 偏高。微调降价防内耗，依靠自然位主收割。"
+
+    # Tier 2: Organic Rank 4 ~ 15 (Critical Flywheel Ascender)
+    elif org_rank is not None and 4 <= org_rank <= 15:
+        if (clicks >= 5 and orders >= 1 and actual_acos <= target_acos * 1.35) or (clicks >= 3 and orders >= 1 and actual_acos <= target_acos):
+            tier = "Tier 2: 临界冲刺"
+            tag = "【临界冲刺·拉升自然位】"
+            action_type = "Boost_Ascender_TOS"
+            new_bid = round((current_bid or 0.35) * 1.15, 2)
+            recom = f"基础竞价提升 15% 至 ${new_bid:.2f}，加注 TOS 溢价至 60%-75%"
+            reason = f"自然位在第 {org_rank} 位，正处于冲入前三的临界突破期！该词转化良好（{orders}单，ACOS {actual_acos:.1f}%），加大 SP 抢占首页顶展，通过密集出单拉升小时出单速度，撬动自然位破壁跃升至 Top 3！"
+        elif spend >= 15.0 and orders == 0:
+            tier = "Tier 2: 冲刺受阻"
+            tag = "【冲刺受阻·控频观察】"
+            action_type = "Throttle_TOS_Bid"
+            new_bid = max(0.25, round((current_bid or 0.40) * 0.80, 2))
+            recom = f"基础竞价下调 20% 至 ${new_bid:.2f}，暂停激进溢价"
+            reason = f"自然位在第 {org_rank} 位，但广告近期无转化流血（花费${spend:.2f} 0单）。暂停盲目冲刺，降价控频避损。"
+        else:
+            tier = "Tier 2: 临界培育"
+            tag = "【临界培育·蓄力突破】"
+            recom = "保持竞价，紧盯转化与自然排名上升趋势"
+            reason = f"自然位第 {org_rank} 位，保持观察，一旦出单提速即可加注冲刺。"
+
+    # Tier 3: Organic Rank 16 ~ 50 (Mid-Page Breakthrough)
+    elif org_rank is not None and 16 <= org_rank <= 50:
+        if orders >= 2 and actual_acos <= target_acos:
+            tier = "Tier 3: 腰部突围"
+            tag = "【腰部突围·单向拉升】"
+            recom = "建议精准 Exact 隔离提权投放，向首页冲刺"
+            reason = f"自然位在第 {org_rank} 位（第2-3页）。转化良好（{orders}单，ACOS {actual_acos:.1f}%），具备冲首页潜质，建议精准隔离推流。"
+        elif spend >= 15.0 and orders == 0:
+            tier = "Tier 3: 腰部承压"
+            tag = "【腰部承压·防守退让】"
+            action_type = "Lower_Bid"
+            new_bid = max(0.22, round((current_bid or 0.35) * 0.75, 2))
+            recom = f"基础竞价下调 25% 至 ${new_bid:.2f}"
+            reason = f"自然位第 {org_rank} 位，广告转化不佳，下调竞价退守商品详情页避损。"
+        else:
+            tier = "Tier 3: 腰部常态"
+            tag = "【腰部常态·平价测流】"
+            recom = "保持中等出价，不给高额 TOS 溢价"
+            reason = f"自然位第 {org_rank} 位，处于常态腰部位置，按标准 ROI 控价。"
+
+    # Tier 4: Organic Rank > 50 or Unranked
+    else:
+        if sp_rank is not None and sp_rank <= 10:
+            tier = "Tier 4: 自然脱节"
+            tag = "【自然脱节·警惕虚火】"
+            action_type = "Throttle_TOS_Bid" if actual_acos > target_acos else ""
+            recom = "严禁盲目高溢价打顶展，降价控频防虚耗"
+            reason = f"SP 广告位第 {sp_rank} 位，但自然位严重脱节（第 {org_rank or '>50'} 位）。系统尚未认可 Listing 与该词强相关，过度用广告买顶展会导致极高 CPC 且无法沉淀自然权重。"
+        else:
+            tier = "Tier 4: 长尾边缘"
+            tag = "【长尾深水·按效出价】"
+            recom = "严格按 ACOS/CVR 控价，达标则投，超标即降"
+            reason = f"自然位第 {org_rank or '>50'} 位，长尾边缘流量，按 ROI 模型精细化调整。"
+
+    return {
+        "organic_rank": org_rank,
+        "organic_page": info.get("organic_page"),
+        "sp_rank": sp_rank,
+        "sp_page": info.get("sp_page"),
+        "organic_traffic": org_traffic,
+        "ad_traffic": ad_traffic,
+        "total_traffic": tot_traffic,
+        "organic_rate": org_rate,
+        "ad_rate": ad_rate,
+        "synergy_tier": tier,
+        "synergy_tag": tag,
+        "action_type": action_type,
+        "recommended_value": recom,
+        "reason": reason,
+    }
+
+
 def extract_asin_target_info(r: dict) -> dict | None:
     """Extract competitor ASIN target metadata from target row."""
     expr = r.get("expression") or r.get("targeting_text") or ""
@@ -563,6 +800,26 @@ def extract_ngrams(text: str) -> list[tuple[str, str]]:
         bigram = f"{valid_words[i]} {valid_words[i+1]}"
         out.append((bigram, "2-gram"))
     return out
+
+
+MIN_KNOWN_NEGATIVE_LEN = 3
+
+
+def is_known_negative(text: str, known_negatives: set[str]) -> bool:
+    """Match a query against the already-negated list.
+
+    Substring matching needs a length floor: without it a 1-2 character entry
+    (or a stray blank line in known_negatives.txt) suppresses every recommendation.
+    """
+    t = (text or "").lower().strip()
+    if not t or not known_negatives:
+        return False
+    for kn in known_negatives:
+        if kn == t:
+            return True
+        if len(kn) >= MIN_KNOWN_NEGATIVE_LEN and kn in t:
+            return True
+    return False
 
 
 def tsv(path: Path, header: str, lines: list[str]) -> None:
@@ -689,7 +946,7 @@ def calc_dynamic_migration_bid(
         cpc_note = f"基准出价参考 (${anchor_cpc:.2f})"
 
     recom_base_bid = round(anchor_cpc / (1.0 + dest_tos / 100.0), 2)
-    recom_base_bid = max(0.20, min(recom_base_bid, 1.20))
+    recom_base_bid = max(0.25, min(recom_base_bid, 1.20))
     eff_tos_bid = round(recom_base_bid * (1.0 + dest_tos / 100.0), 2)
 
     prior_notes = []
@@ -795,7 +1052,7 @@ def infer_search_term_placement(
                 f"物理冲突或竞品品牌词 ({bucket})，已累积 {clicks} 点击 0 订单 (花费 ${spend:.2f})，"
                 f"无论在任何位置展示均无法形成正向转化，果断精准否定彻底止血。"
             )
-        elif is_strong or bucket in ("core", "feature") or v_tier in ("MEGA_HEAD", "CORE_HEAD", "MID_TAIL"):
+        elif (is_strong or bucket in ("core", "feature", "core_feature", "core_or_title") or (v_tier in ("MEGA_HEAD", "CORE_HEAD", "MID_TAIL") and bucket not in ("adjacent", "is_not", "competitor_brand"))):
             if inferred_pos in ("CONFIRMED_PP_CAROUSEL", "PROBABLE_PP_OR_ROS"):
                 strategy_tag = "TRAPPED_CORE_HERO"
                 action_type = "Elevate_To_TOS"
@@ -866,6 +1123,7 @@ def audit_active_negatives(
     sr_map: dict[str, int],
     kws: list[dict] = None,
     camps: list[dict] = None,
+    xydc_map: dict = None,
 ) -> tuple[list[dict], list[dict]]:
     """Audit existing active negatives cross-referencing portfolio targeting.
 
@@ -913,7 +1171,6 @@ def audit_active_negatives(
         clicks = item["clicks"]
         cpc = round(spend / clicks, 2) if clicks else 0.0
         cvr = round(orders / clicks * 100, 1) if clicks else 0.0
-        c_acos = round(spend / sales * 100, 1) if sales > 0 else (9999.0 if spend > 0 else 0.0)
 
         bucket, match_reason, is_strong_relevance = classify_query(q, profile, rules)
         sr, v_tier = get_searchrank(q, sr_map)
@@ -954,10 +1211,26 @@ def audit_active_negatives(
                     f"Negation in {c_name} prevents internal cannibalization and protects dedicated Exact traffic. DO NOT un-negate in Broad!"
                 )
 
-            # Case B: Migrated to Exact, but currently PAUSED (Traffic Blackout!)
+            # Case B: Migrated to Exact, but currently PAUSED (Traffic Blackout vs Intentional Misfit Pause!)
             elif paused_other:
+                # 必须先执行物理冲突与 IS NOT 规则过滤！防止将因属性矛盾故意暂停的词误判为断流而僵尸复活 (Zombie Resurrection)
+                misfit_in_paused = False
+                for pat_item in rules.get("is_not_patterns", []):
+                    pat = pat_item if isinstance(pat_item, str) else pat_item.get("pattern", "")
+                    if pat and re.search(pat, q, re.I):
+                        misfit_in_paused = True
+                        break
+
+                if misfit_in_paused or is_hard_misfit:
+                    audit_status = "INTENTIONAL_PAUSE_CONFLICT"
+                    recom_action = "Keep_Paused"
+                    recom_val = f"Maintain Paused in {paused_other[0]['campaign']} and Negated in {c_name} (Physical Misfit)"
+                    detail_reason = (
+                        f"确凿物理属性冲突（{match_reason}）：该词此前因属性矛盾被合规暂停/否定，"
+                        f"绝非移词断流误杀！严禁建议 Unpause 重新激活，彻底规避买家差评与高退货。"
+                    )
                 # Check if it's a converting or high-relevance query worth reviving
-                if is_strong_relevance or orders >= 1 or (sr is not None and sr < 40000):
+                elif is_strong_relevance or orders >= 1 or (sr is not None and sr < 30000):
                     # Pick best destination campaign to unpause (prefer exact-prove or highest past orders)
                     best_dest = sorted(paused_other, key=lambda x: -x["orders"])[0]
                     dest_camp = best_dest["campaign"]
@@ -985,14 +1258,24 @@ def audit_active_negatives(
                             f"({orders}单, SR={sr_display}, {v_tier})。{bid_calc_desc} "
                             f"处理：在 {dest_camp} 重新开启投放（基础竞价 ${recom_bid:.2f}）；原活动 {c_name} 继续保持否定防内耗。"
                         )
+                        eval_q = evaluate_rank_synergy(term=q, xydc_map=xydc_map or {})
+                        q_org_r = eval_q.get("organic_rank")
+                        q_sp_r = eval_q.get("sp_rank")
+                        if q_org_r is not None or q_sp_r is not None:
+                            rank_tag_q = f"[自然位#{q_org_r or '--'}·广告位#{q_sp_r or '--'} {eval_q.get('synergy_tag', '')}] "
+                            rank_cur_q = f"(自然位#{q_org_r or '--'}, 广告位#{q_sp_r or '--'}) "
+                        else:
+                            rank_tag_q = "[西柚未建位/暂无排名] "
+                            rank_cur_q = "(西柚未建位) "
+
                         unnegative_adjustments.append({
                             "action_type": "Unpause_Keyword",
                             "campaign": dest_camp,
                             "target_entity": q,
                             "match_type": dest_match,
-                            "current_value": "state=paused",
+                            "current_value": f"{rank_cur_q}state=paused",
                             "recommended_value": f"state=enabled (基础竞价 ${recom_bid:.2f})",
-                            "reason": f"移词断流恢复：在 {c_name} 保持否定防内耗，在 {dest_camp} 开启投放。{bid_calc_desc}",
+                            "reason": f"{rank_tag_q}移词断流恢复：在 {c_name} 保持否定防内耗，在 {dest_camp} 开启投放。{bid_calc_desc}",
                         })
                 else:
                     audit_status = "SOFT_MONITOR"
@@ -1013,15 +1296,24 @@ def audit_active_negatives(
                     audit_status = "SAFE_HARD_NEGATIVE"
                     recom_action = "Keep_Negated"
                     recom_val = "Maintain Negative (Permanent Misfit)"
-                    detail_reason = f"Confirmed physical/category conflict via rules. Hard negative eliminates structural waste/bad reviews."
+                    detail_reason = "Confirmed physical/category conflict via rules. Hard negative eliminates structural waste/bad reviews."
                 else:
+                    # Strict qualification for TRUE_ORPHAN_NEGATIVE:
+                    # Must be a proven strong-relevance hero asset with solid historical orders (orders >= 2, or verified high intent with 1+ order),
+                    # and must NOT be an adjacent/generic category head term or contain negative conflict tokens.
+                    # NEVER harvest an existing negative solely because it has high ABA search volume (sr < 35000)!
+                    generic_conflict_patterns = [
+                        r"\bno\s+plastic\b", r"\bplastic\s+free\b", r"\ball\s+glass\b", r"\ball\s+metal\b",
+                        r"\b5\s*cup\b", r"\b12\s*cup\b", r"\bpercolator\b", r"\bespresso\b", r"\bk\s*cup\b",
+                        r"\bcapsule\b", r"\bpod\b", r"\bmanual\b", r"\bcommercial\b"
+                    ]
+                    has_generic_conflict = any(re.search(pat, q, re.I) for pat in generic_conflict_patterns)
+
                     is_core_asset = (
-                        bucket == "brand"
-                        or is_strong_relevance
-                        or bucket in ("core_feature", "core_or_title")
-                        or bucket.startswith("core_")
-                        or orders >= 1
-                        or (sr is not None and sr < 35000)
+                        (bucket == "brand" or is_strong_relevance or bucket in ("core_feature", "core_or_title"))
+                        and not is_hard_misfit
+                        and not has_generic_conflict
+                        and (orders >= 2 or (orders >= 1 and is_strong_relevance))
                     )
 
                     harvest_camp_obj = camp_lookup.get(harvest_camp, {})
@@ -1039,25 +1331,34 @@ def audit_active_negatives(
                             f"但在 {c_name} 被否定且全账户未在任何活动投放。{bid_calc_desc} "
                             f"处理：移入精准仓 ({harvest_camp}) 收割（基础竞价 ${recom_bid:.2f}）；原活动 {c_name} 保持否定防内耗。"
                         )
+                        eval_q = evaluate_rank_synergy(term=q, xydc_map=xydc_map or {})
+                        q_org_r = eval_q.get("organic_rank")
+                        q_sp_r = eval_q.get("sp_rank")
+                        if q_org_r is not None or q_sp_r is not None:
+                            rank_tag_q = f"[自然位#{q_org_r or '--'}·广告位#{q_sp_r or '--'} {eval_q.get('synergy_tag', '')}] "
+                            rank_cur_q = f"(自然位#{q_org_r or '--'}, 广告位#{q_sp_r or '--'}) "
+                        else:
+                            rank_tag_q = "[西柚未建位/暂无排名] "
+                            rank_cur_q = "(西柚未建位) "
+
                         unnegative_adjustments.append({
                             "action_type": "Harvest_To_Exact",
                             "campaign": harvest_camp,
                             "target_entity": q,
                             "match_type": "exact",
-                            "current_value": f"Negated in {c_name}, untargeted in portfolio",
+                            "current_value": f"{rank_cur_q}Negated in {c_name}, untargeted in portfolio",
                             "recommended_value": f"Add Exact Target (基础竞价 ${recom_bid:.2f})",
-                            "reason": f"孤儿核心资产收割：在 {c_name} 保持否定防内耗，移入 {harvest_camp} 独立收割。{bid_calc_desc}",
+                            "reason": f"{rank_tag_q}孤儿核心资产收割：在 {c_name} 保持否定防内耗，移入 {harvest_camp} 独立收割。{bid_calc_desc}",
                         })
                     else:
                         audit_status = "SOFT_MONITOR"
-                        recom_action = "Keep_Negated_Monitor"
-                        recom_val = f"Maintain Negated in {c_name}"
-                        detail_reason = f"Untargeted search term (orders={orders}, spend=${spend:.2f}); maintain negative and monitor."
-
-                    audit_status = "SOFT_MONITOR"
-                    recom_action = "Keep_Negated_Offpeak"
-                    recom_val = "Maintain Negative; Re-test in Q4 Holiday Season"
-                    detail_reason = f"Adjacent/peripheral query with low off-peak momentum (spend=${spend:.2f}, ord={orders}). Keep negated during routine period."
+                        recom_action = "Keep_Negated_Offpeak"
+                        recom_val = "Maintain Negative; Re-test in Q4 Holiday Season"
+                        detail_reason = (
+                            f"Adjacent/peripheral query with low off-peak momentum "
+                            f"(spend=${spend:.2f}, ord={orders}); untargeted across the portfolio. "
+                            f"Keep negated during routine period."
+                        )
 
         audit_records.append({
             "campaign": c_name,
@@ -1094,6 +1395,16 @@ def audit_keyword_misfits(kws: list[dict], rules: dict, camps: list[dict] = None
             continue
         text = str(k.get("keyword_text") or k.get("targeting_text") or "").strip()
         bid = num(k.get("bid"))
+        orders = int(num(k.get("orders")))
+        spend = num(k.get("spends"))
+        sales = num(k.get("sales"))
+        acos = (spend / sales * 100) if sales > 0 else 999.0
+
+        # 出单词防误杀最高豁免权：若历史已验证出单 (orders >= 2 且 ACOS <= 45%)，
+        # 说明该词属于高转化跨界多用途词（如磨豆机兼香料研磨 spice grinder），严禁一刀切暂停！
+        if orders >= 2 and acos <= 45.0:
+            continue
+
         for pat_item in is_not_patterns:
             pat = pat_item if isinstance(pat_item, str) else pat_item.get("pattern", "")
             label = "is_not" if isinstance(pat_item, str) else pat_item.get("label", "is_not")
@@ -1105,7 +1416,7 @@ def audit_keyword_misfits(kws: list[dict], rules: dict, camps: list[dict] = None
                     "match_type": k.get("match_type") or "exact",
                     "current_value": f"bid=${bid:.2f}, state=enabled, label={label}",
                     "recommended_value": "Pause Keyword Immediately",
-                    "reason": f"Physical attribute conflict ({label}, pattern: {pat}). Product is blade grinder; targeting this generates customer dissatisfaction and returns.",
+                    "reason": f"Physical attribute conflict ({label}, pattern: {pat}). This target contradicts the product's own attributes; it draws mismatched buyers and drives returns.",
                 })
                 break
     return adjustments
@@ -1151,7 +1462,6 @@ def get_snapshot_key(meta: dict, profile: dict, camps: list[dict] | None = None)
     if camps:
         pf_ids = [str(c.get("portfolio_id")) for c in camps if c.get("portfolio_id") and str(c.get("portfolio_id")) not in ("None", "0", "")]
         if pf_ids:
-            from collections import Counter
             top_pf = Counter(pf_ids).most_common(1)[0][0]
             return f"portfolio_{top_pf}"
 
@@ -1175,6 +1485,175 @@ def load_snapshot(snapshot_path: Path) -> dict:
     }
 
 
+# Control variables we snapshot and diff between runs. Each entry says how to read the
+# value off a current row, how to render it in the ledger, and what entity_type to log.
+# Adding a tracked field is one row here -- the diff, cooldown and ledger wiring is shared.
+CAMPAIGN_FIELDS = [
+    ("tos", "campaign_tos", lambda v: f"{v}%"),
+    ("pp", "campaign_pp", lambda v: f"{v}%"),
+    ("ros", "campaign_ros", lambda v: f"{v}%"),
+    ("budget", "campaign_budget", lambda v: f"${num(v):.2f}"),
+    ("state", "campaign_state", str),
+]
+
+# Bid moves below this are rounding noise, not a deliberate adjustment.
+BID_EPSILON = 0.02
+BUDGET_EPSILON = 0.01
+
+
+def _campaign_baseline(camp: dict | None) -> dict:
+    """Recent-slice metrics captured at adjustment time, so later runs can attribute the effect."""
+    camp = camp or {}
+    return {
+        "baseline_cpc": round(num(camp.get("cpc_3d") or camp.get("cpc_7d") or camp.get("cpc")), 2),
+        "baseline_daily_imp": round(num(camp.get("daily_imp_3d") or camp.get("daily_imp_30d")), 1),
+        "baseline_acos": round(num(camp.get("acos_7d") or camp.get("acos")), 1),
+    }
+
+
+def _changed(field: str, old_val, new_val) -> bool:
+    if field == "budget":
+        return abs(num(new_val) - num(old_val)) >= BUDGET_EPSILON
+    if field == "bid":
+        return abs(num(new_val) - num(old_val)) >= BID_EPSILON and num(new_val) > 0 and num(old_val) > 0
+    return new_val != old_val
+
+
+def _record_change(
+    *,
+    now: datetime,
+    cooldown_days: int,
+    campaign: str,
+    entity_type: str,
+    entity_name: str,
+    entity_key: str | None,
+    field: str,
+    old_val,
+    new_val,
+    render,
+    msg: str,
+    camp_lookup: dict,
+    diff_events: list[str],
+    new_diff_items: list[dict],
+    active_cooldowns: list[dict],
+    locked_campaigns: set[str],
+) -> None:
+    """Log one control-variable change: diff line, cooldown lock, and ledger seed row."""
+    now_iso = now.isoformat()
+    diff_events.append(f"Campaign '{campaign}': {msg}")
+
+    cooldown = {
+        "entity_type": entity_type,
+        "campaign": campaign,
+        "field": field,
+        "old_value": old_val,
+        "new_value": new_val,
+        "changed_at": now_iso,
+        "cooldown_until": (now + timedelta(days=cooldown_days)).isoformat(),
+        "days_elapsed": 0,
+        "days_remaining": cooldown_days,
+        "detail": msg,
+    }
+    if entity_key:
+        cooldown["entity_key"] = entity_key
+    active_cooldowns.append(cooldown)
+    locked_campaigns.add(campaign)
+
+    new_diff_items.append({
+        "id": f"ADJ-{now.strftime('%Y%m%d%H%M%S')}-{len(new_diff_items) + 1:02d}",
+        "change_date": now.strftime("%Y-%m-%d"),
+        "changed_at": now_iso,
+        "campaign": campaign,
+        "entity_type": entity_type,
+        "entity_name": entity_name,
+        "field": field,
+        "old_val": render(old_val),
+        "new_val": render(new_val),
+        **_campaign_baseline(camp_lookup.get(campaign)),
+        "detail": msg,
+    })
+
+
+def _snapshot_campaigns(camps: list[dict]) -> dict[str, dict]:
+    out = {}
+    for c in camps:
+        name = c.get("name")
+        if not name:
+            continue
+        out[name] = {
+            "name": name,
+            "tos": int(c.get("tos", 0)),
+            "pp": int(c.get("pp", 0)),
+            "ros": int(c.get("ros", 0)),
+            "budget": float(c.get("budget", 0.0)),
+            "state": str(c.get("state", "")),
+        }
+    return out
+
+
+def _snapshot_keywords(kws: list[dict]) -> dict[str, dict]:
+    out = {}
+    for k in kws:
+        text = k.get("keyword_text") or ""
+        if not text:
+            continue
+        c_name = k.get("campaign_name") or ""
+        match = k.get("match_type") or ""
+        out[f"{c_name}::{match}::{text.lower().strip()}"] = {
+            "campaign": c_name,
+            "text": text,
+            "match": match,
+            "bid": num(k.get("bid")),
+            "state": str(k.get("state", "")),
+        }
+    return out
+
+
+def _snapshot_targets(targets: list[dict]) -> dict[str, dict]:
+    out = {}
+    for t in targets:
+        text = t.get("targeting_text") or t.get("expression") or t.get("keyword_text") or ""
+        if not text:
+            continue
+        c_name = t.get("campaign_name") or ""
+        ttype = t.get("exp_type_zh") or t.get("exp_type_text") or t.get("match_type") or ""
+        out[f"{c_name}::{ttype}::{text.lower().strip()}"] = {
+            "campaign": c_name,
+            "text": text,
+            "type": ttype,
+            "bid": num(t.get("bid")),
+            "state": str(t.get("state", "")),
+        }
+    return out
+
+
+def _carry_forward_cooldowns(prev_cooldowns: list[dict], now: datetime) -> tuple[list[dict], set[str]]:
+    """Keep cooldowns that have not expired yet and refresh their elapsed/remaining counters."""
+    active: list[dict] = []
+    locked: set[str] = set()
+    now_iso = now.isoformat()
+    for item in prev_cooldowns:
+        until_str = item.get("cooldown_until")
+        if not until_str:
+            continue
+        try:
+            until = datetime.fromisoformat(until_str)
+        except Exception:
+            continue
+        if now >= until:
+            continue
+        try:
+            changed_at = datetime.fromisoformat(item.get("changed_at", now_iso))
+        except Exception:
+            changed_at = now
+        item["days_elapsed"] = max(0, (now - changed_at).days)
+        item["days_remaining"] = max(0, (until - now).days)
+        active.append(item)
+        if item.get("campaign"):
+            locked.add(item["campaign"])
+    return active, locked
+
+
 def diff_and_track_cooldown(
     prev_snap: dict,
     curr_camps: list[dict],
@@ -1192,290 +1671,74 @@ def diff_and_track_cooldown(
     - new_diff_items: structured diff items with baseline metrics for ledger
     """
     now = datetime.now()
-    now_iso = now.isoformat()
 
-    # Build current state maps
-    curr_camp_map = {}
-    for c in curr_camps:
-        name = c.get("name")
-        if not name:
-            continue
-        curr_camp_map[name] = {
-            "name": name,
-            "tos": int(c.get("tos", 0)),
-            "pp": int(c.get("pp", 0)),
-            "ros": int(c.get("ros", 0)),
-            "budget": float(c.get("budget", 0.0)),
-            "state": str(c.get("state", "")),
-        }
+    curr_camp_map = _snapshot_campaigns(curr_camps)
+    curr_kw_map = _snapshot_keywords(curr_kws)
+    curr_target_map = _snapshot_targets(curr_targets)
 
-    curr_kw_map = {}
-    for k in curr_kws:
-        c_name = k.get("campaign_name") or ""
-        match = k.get("match_type") or ""
-        text = k.get("keyword_text") or ""
-        if not text:
-            continue
-        key = f"{c_name}::{match}::{text.lower().strip()}"
-        curr_kw_map[key] = {
-            "campaign": c_name,
-            "text": text,
-            "match": match,
-            "bid": num(k.get("bid")),
-            "state": str(k.get("state", "")),
-        }
-
-    curr_target_map = {}
-    for t in curr_targets:
-        c_name = t.get("campaign_name") or ""
-        ttype = t.get("exp_type_zh") or t.get("exp_type_text") or t.get("match_type") or ""
-        text = t.get("targeting_text") or t.get("expression") or t.get("keyword_text") or ""
-        if not text:
-            continue
-        key = f"{c_name}::{ttype}::{text.lower().strip()}"
-        curr_target_map[key] = {
-            "campaign": c_name,
-            "text": text,
-            "type": ttype,
-            "bid": num(t.get("bid")),
-            "state": str(t.get("state", "")),
-        }
+    camp_lookup = {c.get("name"): c for c in curr_camps if c.get("name")}
 
     prev_camps = prev_snap.get("campaigns") or {}
     prev_kws = prev_snap.get("keywords") or {}
     prev_targets = prev_snap.get("targets") or {}
-    prev_cooldowns = prev_snap.get("active_cooldowns") or []
 
-    # 1. Prune expired cooldowns and retain active ones
-    active_cooldowns = []
-    locked_campaigns = set()
-    for item in prev_cooldowns:
-        c_until_str = item.get("cooldown_until")
-        if c_until_str:
-            try:
-                c_until = datetime.fromisoformat(c_until_str)
-                if now < c_until:
-                    # Still in cooldown
-                    changed_at = datetime.fromisoformat(item.get("changed_at", now_iso))
-                    days_elapsed = max(0, (now - changed_at).days)
-                    item["days_elapsed"] = days_elapsed
-                    item["days_remaining"] = max(0, (c_until - now).days)
-                    active_cooldowns.append(item)
-                    if item.get("campaign"):
-                        locked_campaigns.add(item["campaign"])
-            except Exception:
-                pass
+    active_cooldowns, locked_campaigns = _carry_forward_cooldowns(prev_snap.get("active_cooldowns") or [], now)
+    diff_events: list[str] = []
+    new_diff_items: list[dict] = []
 
-    diff_events = []
-    new_diff_items = []
+    def log(**kw):
+        _record_change(
+            now=now, cooldown_days=cooldown_days, camp_lookup=camp_lookup,
+            diff_events=diff_events, new_diff_items=new_diff_items,
+            active_cooldowns=active_cooldowns, locked_campaigns=locked_campaigns, **kw
+        )
 
-    # 2. Check campaign diffs (only if prev_camps exists)
+    # 1. Campaign placement modifiers, budget and state
     if prev_camps:
         for name, curr in curr_camp_map.items():
-            if name in prev_camps:
-                prev = prev_camps[name]
-                matching_c = next((x for x in curr_camps if x.get("name") == name), {})
-                base_cpc = round(num(matching_c.get("cpc_3d") or matching_c.get("cpc_7d") or matching_c.get("cpc")), 2)
-                base_imp = round(num(matching_c.get("daily_imp_3d") or matching_c.get("daily_imp_30d")), 1)
-                base_acos = round(num(matching_c.get("acos_7d") or matching_c.get("acos")), 1)
+            prev = prev_camps.get(name)
+            if prev is None:
+                continue
+            for field, entity_type, render in CAMPAIGN_FIELDS:
+                old_val, new_val = prev.get(field), curr[field]
+                if old_val is None or not _changed(field, old_val, new_val):
+                    continue
+                label = "State" if field == "state" else field.upper()
+                log(
+                    campaign=name, entity_type=entity_type, entity_name=name, entity_key=None,
+                    field=field, old_val=old_val, new_val=new_val, render=render,
+                    msg=f"{label} changed: {render(old_val)} -> {render(new_val)}",
+                )
 
-                # Check TOS
-                if curr["tos"] != prev.get("tos"):
-                    msg = f"TOS changed: {prev.get('tos')}% -> {curr['tos']}%"
-                    diff_events.append(f"Campaign '{name}': {msg}")
-                    cd = {
-                        "entity_type": "campaign_tos",
-                        "campaign": name,
-                        "field": "tos",
-                        "old_value": prev.get("tos"),
-                        "new_value": curr["tos"],
-                        "changed_at": now_iso,
-                        "cooldown_until": (now + timedelta(days=cooldown_days)).isoformat(),
-                        "days_elapsed": 0,
-                        "days_remaining": cooldown_days,
-                        "detail": msg,
-                    }
-                    active_cooldowns.append(cd)
-                    locked_campaigns.add(name)
-                    new_diff_items.append({
-                        "id": f"ADJ-{now.strftime('%Y%m%d%H%M%S')}-{len(new_diff_items)+1:02d}",
-                        "change_date": now.strftime("%Y-%m-%d"),
-                        "changed_at": now_iso,
-                        "campaign": name,
-                        "entity_type": "campaign_tos",
-                        "entity_name": name,
-                        "field": "tos",
-                        "old_val": f"{prev.get('tos')}%",
-                        "new_val": f"{curr['tos']}%",
-                        "baseline_cpc": base_cpc,
-                        "baseline_daily_imp": base_imp,
-                        "baseline_acos": base_acos,
-                        "detail": msg,
-                    })
-
-                # Check ROS
-                if curr["ros"] != prev.get("ros"):
-                    msg = f"ROS changed: {prev.get('ros')}% -> {curr['ros']}%"
-                    diff_events.append(f"Campaign '{name}': {msg}")
-                    cd = {
-                        "entity_type": "campaign_ros",
-                        "campaign": name,
-                        "field": "ros",
-                        "old_value": prev.get("ros"),
-                        "new_value": curr["ros"],
-                        "changed_at": now_iso,
-                        "cooldown_until": (now + timedelta(days=cooldown_days)).isoformat(),
-                        "days_elapsed": 0,
-                        "days_remaining": cooldown_days,
-                        "detail": msg,
-                    }
-                    active_cooldowns.append(cd)
-                    locked_campaigns.add(name)
-                    new_diff_items.append({
-                        "id": f"ADJ-{now.strftime('%Y%m%d%H%M%S')}-{len(new_diff_items)+1:02d}",
-                        "change_date": now.strftime("%Y-%m-%d"),
-                        "changed_at": now_iso,
-                        "campaign": name,
-                        "entity_type": "campaign_ros",
-                        "entity_name": name,
-                        "field": "ros",
-                        "old_val": f"{prev.get('ros')}%",
-                        "new_val": f"{curr['ros']}%",
-                        "baseline_cpc": base_cpc,
-                        "baseline_daily_imp": base_imp,
-                        "baseline_acos": base_acos,
-                        "detail": msg,
-                    })
-
-                # Check State (e.g. paused)
-                if curr["state"] != prev.get("state"):
-                    msg = f"State changed: {prev.get('state')} -> {curr['state']}"
-                    diff_events.append(f"Campaign '{name}': {msg}")
-                    cd = {
-                        "entity_type": "campaign_state",
-                        "campaign": name,
-                        "field": "state",
-                        "old_value": prev.get("state"),
-                        "new_value": curr["state"],
-                        "changed_at": now_iso,
-                        "cooldown_until": (now + timedelta(days=cooldown_days)).isoformat(),
-                        "days_elapsed": 0,
-                        "days_remaining": cooldown_days,
-                        "detail": msg,
-                    }
-                    active_cooldowns.append(cd)
-                    locked_campaigns.add(name)
-                    new_diff_items.append({
-                        "id": f"ADJ-{now.strftime('%Y%m%d%H%M%S')}-{len(new_diff_items)+1:02d}",
-                        "change_date": now.strftime("%Y-%m-%d"),
-                        "changed_at": now_iso,
-                        "campaign": name,
-                        "entity_type": "campaign_state",
-                        "entity_name": name,
-                        "field": "state",
-                        "old_val": str(prev.get("state")),
-                        "new_val": str(curr["state"]),
-                        "baseline_cpc": base_cpc,
-                        "baseline_daily_imp": base_imp,
-                        "baseline_acos": base_acos,
-                        "detail": msg,
-                    })
-
-    # 3. Check keyword diffs (bids)
-    if prev_kws:
-        for key, curr in curr_kw_map.items():
-            if key in prev_kws:
-                prev = prev_kws[key]
-                if abs(curr["bid"] - prev.get("bid", 0.0)) >= 0.02 and curr["bid"] > 0 and prev.get("bid", 0) > 0:
-                    msg = f"Keyword '{curr['text']}' [{curr['match']}] bid changed: ${prev.get('bid'):.2f} -> ${curr['bid']:.2f}"
-                    diff_events.append(f"Campaign '{curr['campaign']}': {msg}")
-                    cd = {
-                        "entity_type": "keyword_bid",
-                        "campaign": curr["campaign"],
-                        "entity_key": key,
-                        "field": "bid",
-                        "old_value": prev.get("bid"),
-                        "new_value": curr["bid"],
-                        "changed_at": now_iso,
-                        "cooldown_until": (now + timedelta(days=cooldown_days)).isoformat(),
-                        "days_elapsed": 0,
-                        "days_remaining": cooldown_days,
-                        "detail": msg,
-                    }
-                    active_cooldowns.append(cd)
-                    locked_campaigns.add(curr["campaign"])
-                    matching_c = next((x for x in curr_camps if x.get("name") == curr["campaign"]), {})
-                    base_cpc = round(num(matching_c.get("cpc_3d") or matching_c.get("cpc_7d") or matching_c.get("cpc")), 2)
-                    base_imp = round(num(matching_c.get("daily_imp_3d") or matching_c.get("daily_imp_30d")), 1)
-                    base_acos = round(num(matching_c.get("acos_7d") or matching_c.get("acos")), 1)
-                    new_diff_items.append({
-                        "id": f"ADJ-{now.strftime('%Y%m%d%H%M%S')}-{len(new_diff_items)+1:02d}",
-                        "change_date": now.strftime("%Y-%m-%d"),
-                        "changed_at": now_iso,
-                        "campaign": curr["campaign"],
-                        "entity_type": "keyword_bid",
-                        "entity_name": f"{curr['text']} [{curr['match']}]",
-                        "field": "bid",
-                        "old_val": f"${prev.get('bid'):.2f}",
-                        "new_val": f"${curr['bid']:.2f}",
-                        "baseline_cpc": base_cpc,
-                        "baseline_daily_imp": base_imp,
-                        "baseline_acos": base_acos,
-                        "detail": msg,
-                    })
-
-    # 4. Check target diffs (bids)
-    if prev_targets:
-        for key, curr in curr_target_map.items():
-            if key in prev_targets:
-                prev = prev_targets[key]
-                if abs(curr["bid"] - prev.get("bid", 0.0)) >= 0.02 and curr["bid"] > 0 and prev.get("bid", 0) > 0:
-                    msg = f"Target '{curr['text']}' [{curr['type']}] bid changed: ${prev.get('bid'):.2f} -> ${curr['bid']:.2f}"
-                    diff_events.append(f"Campaign '{curr['campaign']}': {msg}")
-                    cd = {
-                        "entity_type": "target_bid",
-                        "campaign": curr["campaign"],
-                        "entity_key": key,
-                        "field": "bid",
-                        "old_value": prev.get("bid"),
-                        "new_value": curr["bid"],
-                        "changed_at": now_iso,
-                        "cooldown_until": (now + timedelta(days=cooldown_days)).isoformat(),
-                        "days_elapsed": 0,
-                        "days_remaining": cooldown_days,
-                        "detail": msg,
-                    }
-                    active_cooldowns.append(cd)
-                    locked_campaigns.add(curr["campaign"])
-                    matching_c = next((x for x in curr_camps if x.get("name") == curr["campaign"]), {})
-                    base_cpc = round(num(matching_c.get("cpc_3d") or matching_c.get("cpc_7d") or matching_c.get("cpc")), 2)
-                    base_imp = round(num(matching_c.get("daily_imp_3d") or matching_c.get("daily_imp_30d")), 1)
-                    base_acos = round(num(matching_c.get("acos_7d") or matching_c.get("acos")), 1)
-                    new_diff_items.append({
-                        "id": f"ADJ-{now.strftime('%Y%m%d%H%M%S')}-{len(new_diff_items)+1:02d}",
-                        "change_date": now.strftime("%Y-%m-%d"),
-                        "changed_at": now_iso,
-                        "campaign": curr["campaign"],
-                        "entity_type": "target_bid",
-                        "entity_name": f"{curr['text']} [{curr['type']}]",
-                        "field": "bid",
-                        "old_val": f"${prev.get('bid'):.2f}",
-                        "new_val": f"${curr['bid']:.2f}",
-                        "baseline_cpc": base_cpc,
-                        "baseline_daily_imp": base_imp,
-                        "baseline_acos": base_acos,
-                        "detail": msg,
-                    })
+    # 2. Keyword and product-target bids
+    for prev_map, curr_map, entity_type, label_key in (
+        (prev_kws, curr_kw_map, "keyword_bid", "match"),
+        (prev_targets, curr_target_map, "target_bid", "type"),
+    ):
+        if not prev_map:
+            continue
+        noun = "Keyword" if entity_type == "keyword_bid" else "Target"
+        for key, curr in curr_map.items():
+            prev = prev_map.get(key)
+            if prev is None or not _changed("bid", prev.get("bid", 0.0), curr["bid"]):
+                continue
+            entity_name = f"{curr['text']} [{curr[label_key]}]"
+            log(
+                campaign=curr["campaign"], entity_type=entity_type, entity_name=entity_name,
+                entity_key=key, field="bid", old_val=prev.get("bid"), new_val=curr["bid"],
+                render=lambda v: f"${num(v):.2f}",
+                msg=f"{noun} '{curr['text']}' [{curr[label_key]}] bid changed: "
+                    f"${num(prev.get('bid')):.2f} -> ${curr['bid']:.2f}",
+            )
 
     new_snap = {
-        "updated_at": now_iso,
+        "updated_at": now.isoformat(),
         "campaigns": curr_camp_map,
         "keywords": curr_kw_map,
         "targets": curr_target_map,
         "active_cooldowns": active_cooldowns,
     }
     return new_snap, active_cooldowns, locked_campaigns, diff_events, new_diff_items
-
 
 def load_and_sync_ledger(
     ledger_file: Path,
@@ -1488,6 +1751,7 @@ def load_and_sync_ledger(
     and dynamically attribute post-adjustment performance (Delta CPC, Delta Imp, Verdict).
     """
     now = datetime.now()
+    camp_lookup = {c.get("name"): c for c in curr_camps if c.get("name")}
     ledger = []
     if ledger_file.exists():
         try:
@@ -1501,10 +1765,10 @@ def load_and_sync_ledger(
     if not ledger and prev_snapshot.get("active_cooldowns"):
         for idx, item in enumerate(prev_snapshot["active_cooldowns"]):
             c_name = item.get("campaign") or ""
-            matching_camp = next((x for x in curr_camps if x.get("name") == c_name), {})
-            base_cpc = round(num(matching_camp.get("cpc_3d") or matching_camp.get("cpc_7d") or matching_camp.get("cpc")), 2)
-            base_imp = round(num(matching_camp.get("daily_imp_3d") or matching_camp.get("daily_imp_30d")), 1)
-            base_acos = round(num(matching_camp.get("acos_7d") or matching_camp.get("acos")), 1)
+            baseline = _campaign_baseline(camp_lookup.get(c_name))
+            base_cpc = baseline["baseline_cpc"]
+            base_imp = baseline["baseline_daily_imp"]
+            base_acos = baseline["baseline_acos"]
             ch_at = item.get("changed_at") or now.isoformat()
             ch_date = ch_at[:10]
             old_v = str(item.get("old_value"))
@@ -1545,7 +1809,7 @@ def load_and_sync_ledger(
     active_cooldowns = []
     for item in ledger:
         c_name = item.get("campaign") or ""
-        matching_camp = next((x for x in curr_camps if x.get("name") == c_name), None)
+        matching_camp = camp_lookup.get(c_name)
         ch_at_str = item.get("changed_at") or now.isoformat()
         try:
             ch_at = datetime.fromisoformat(ch_at_str)
@@ -1719,24 +1983,8 @@ def save_ledger_files(ledger: list[dict], ledger_dir: Path, snap_key: str, dest:
 
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--indir", required=True)
-    parser.add_argument("--outdir", required=True)
-    parser.add_argument("--rules", default=None, help="Optional path to product_rules.json")
-    parser.add_argument("--snapshots-dir", default=None, help="Optional path to snapshots directory")
-    parser.add_argument("--db-dir", default=None, help="Optional path to database directory (default: workspace db/)")
-    parser.add_argument("--cooldown-days", type=int, default=7, help="Cooldown observation period in days (default: 7)")
-    parser.add_argument("--target-acos", type=float, default=None, help="Target ACOS percent threshold (e.g. 25.0)")
-    parser.add_argument("--timestamp", default=None, help="Optional timestamp string (e.g. 20260926-104901). Defaults to current local time.")
-    parser.add_argument("--known-negatives", default=None, help="Comma-separated or file path of already negated keywords/phrases")
-    parser.add_argument("--export-dir", default=None, help="Optional export directory (e.g. outputs) to export timestamped bulk adjustments table.")
-    args = parser.parse_args()
-
-    src = Path(args.indir)
-    dest = Path(args.outdir)
-    dest.mkdir(parents=True, exist_ok=True)
-
+def load_known_negatives(args, src):
+    """Collect keywords already negated outside this tool, so we stop re-recommending them."""
     # Load known negatives to prevent redundant recommendations
     known_negatives = set()
     for kn_candidate in [src / "known_negatives.txt", Path("known_negatives.txt"), src / "known_negatives.json", Path("known_negatives.json")]:
@@ -1759,6 +2007,10 @@ def main() -> None:
             if t:
                 known_negatives.add(t)
 
+    return known_negatives
+
+def load_product_context(args, dest, src):
+    """Load the listing, financial, traffic and dayparting profiles and settle the target ACOS."""
     meta = load_json(src / "meta.json") or {}
     listing = load_json(src / "listing.json")
     stock = load_json(src / "fba_stock.json")
@@ -1799,6 +2051,14 @@ def main() -> None:
         target_acos = float(rules.get("target_acos"))
     elif financial_prof and financial_prof.get("break_even_acos", 0) > 0:
         target_acos = round(financial_prof["break_even_acos"] * 0.68, 1)
+
+    # Rule 33: Refund Rate Crisis Contract
+    refund_rate = financial_prof.get("refund_rate", 0.0) if financial_prof else 0.0
+    if refund_rate >= 12.0:
+        profile["critical_refund_alert"] = True
+        # Contract target ACOS by 18-20% to avoid burning ad spend on high-return units
+        target_acos = max(15.0, round(target_acos * 0.82, 1))
+
     profile["target_acos"] = target_acos
 
     profile["rules_loaded"] = {
@@ -1812,6 +2072,10 @@ def main() -> None:
         json.dumps(profile, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
+    return dayparting_records, dayparting_table_lines, financial_prof, gen_time_str, meta, profile, rules, target_acos, traffic_prof
+
+def load_report_frames(meta, profile, src):
+    """Load every ads report, scope it to this ASIN's campaigns, and attach 7d/3d deltas."""
     product_ads = as_rows(load_json(src / "product_ads.json"))
     asin = str((meta.get("asin") or profile.get("asin") or "")).upper()
     asin_campaigns = set()
@@ -1903,16 +2167,11 @@ def main() -> None:
     if asin_campaigns:
         targets = [r for r in targets if r.get("campaign_name") in asin_campaigns]
 
-    targets_7d_raw = load_json(src / "targets_7d.json")
-    targets_7d = as_rows(targets_7d_raw) if targets_7d_raw else []
-    if asin_campaigns:
-        targets_7d = [r for r in targets_7d if r.get("campaign_name") in asin_campaigns]
 
-    targets_3d_raw = load_json(src / "targets_3d.json")
-    targets_3d = as_rows(targets_3d_raw) if targets_3d_raw else []
-    if asin_campaigns:
-        targets_3d = [r for r in targets_3d if r.get("campaign_name") in asin_campaigns]
+    return asin_campaigns, camps, kws, kws_3d, kws_7d, targets
 
+def run_state_tracking(args, camps, dayparting_records, financial_prof, kws, meta, profile, src, targets, traffic_prof):
+    """Diff control variables against the last snapshot, sync the ledger, and archive today's record."""
     # --------------------------------------------------------------------------
     # Database, Snapshot & Persistent Ledger Execution
     # --------------------------------------------------------------------------
@@ -1941,14 +2200,12 @@ def main() -> None:
         if cd.get("campaign"):
             locked_campaigns.add(cd["campaign"])
 
-    # Archive Daily Record into Database
     gen_date_str = datetime.now().strftime("%Y-%m-%d")
-    now_iso = datetime.now().isoformat()
-    archive_daily_record(
-        daily_records_dir, snap_key, gen_date_str, now_iso,
-        meta, profile, financial_prof, traffic_prof, camps, dayparting_records
-    )
 
+    return active_cooldowns, daily_records_dir, diff_events, gen_date_str, ledger, ledger_dir, locked_campaigns, snap_key
+
+def write_campaigns_tsv(camps, dest):
+    """campaigns.tsv -- 30d macro, 7d trend, 3d latest slice and their deltas."""
     # 1. Output campaigns.tsv (With 30d Macro, 7d Trend, 3d Latest Slice and Deltas)
     camp_lines = []
     for c in camps:
@@ -1973,6 +2230,9 @@ def main() -> None:
         camp_lines,
     )
 
+
+def assess_and_write_placements(active_cooldowns, args, camps, dest, locked_campaigns, target_acos, traffic_prof=None):
+    """Grade each enabled campaign (circuit breakers, cooldown, placement risk) into placement_audit.tsv."""
     # 2. Output placement_audit.tsv (Multi-Window Dynamic Delta & Adaptive Correction)
     placement_lines = []
     for c in camps:
@@ -1984,38 +2244,39 @@ def main() -> None:
         # Effective CPC for forward recommendations is RECENT CPC (cpc_3d > cpc_7d > cpc_30d)
         effective_cpc = c["cpc_3d"] if c["cpc_3d"] > 0 else (c["cpc_7d"] if c["cpc_7d"] > 0 else c["cpc"])
 
-        # Check if campaign is currently in observation/cooldown period
-        if c["name"] in locked_campaigns:
+        # 1. Post-adjustment Asphyxiation (调后休克断流): Universal check if recent daily imp dropped >70%
+        if c["delta_imp_pct"] <= -70.0 and c["daily_imp_30d"] >= 30:
+            assessment = "CIRCUIT_BREAKER_SHOCK"
+            baseline_cpc = c.get("cpc", 0.50)
+            cur_tos = c.get("tos", 0)
+            suggested_bid = max(0.25, round(baseline_cpc / (1.0 + (cur_tos / 100.0)), 2))
+            recom = f"[调后休克断流·立即回踩探底] 近3天日均曝光从 {c['daily_imp_30d']:.0f} 暴跌至 {c['daily_imp_3d']:.0f} ({c['delta_imp_pct']:+.1f}%)；出价降破市场门槛导致断流，打破观察期，建议回提基础竞价至 ${suggested_bid:.2f} 探底拉回展示池"
+
+        # 2. Post-adjustment Ongoing Bleed (调后持续失血): High spend with 0 orders, or ACOS doubled
+        elif (c["spend_3d"] >= 15 and c["ord_3d"] == 0) or (c["spend"] >= 15 and c["ord"] == 0 and c["spend_7d"] >= 10):
+            assessment = "CIRCUIT_BREAKER_BLEED"
+            recom = f"[调后持续失血·紧急纠偏] 调整后近3天花费 ${c['spend_3d']:.1f} 仍为 0 单 (7天花 ${c['spend_7d']:.1f})；上次幅度不足或词流未阻断，打破观察期，二次削减 TOS/PP 溢价或下调基础竞价"
+        elif c["ord_3d"] > 0 and c["spend_3d"] >= 25 and c["acos_3d"] >= (target_acos * 2.0):
+            assessment = "CIRCUIT_BREAKER_BLEED"
+            recom = f"[调后持续失血·ACOS爆表] 近3天 ACOS 达 {c['acos_3d']:.1f}% (目标 {target_acos:.0f}%)；打破观察期，紧急下调基础竞价防守"
+
+        # 3. Check if campaign is currently in observation/cooldown period
+        elif c["name"] in locked_campaigns:
             cd_match = [x for x in active_cooldowns if x.get("campaign") == c["name"]]
             detail = cd_match[0].get("detail", "Recent parameter adjustment") if cd_match else "Recent parameter adjustment"
             elapsed = cd_match[0].get("days_elapsed", 0) if cd_match else 0
 
-            # 1. Post-adjustment Asphyxiation (调后休克断流): Recent 3d daily imp dropped by >70%
-            if c["delta_imp_pct"] <= -70.0 and c["daily_imp_30d"] >= 50:
-                assessment = "CIRCUIT_BREAKER_SHOCK"
-                recom = f"[调后休克断流·立即回踩探底] 近3天日均曝光从 {c['daily_imp_30d']:.0f} 暴跌至 {c['daily_imp_3d']:.0f} ({c['delta_imp_pct']:+.1f}%)；出价降破市场门槛导致断流，立即打破观察期，基础竞价回提 10%-15% 探底拉回展示池"
-
-            # 2. Post-adjustment Ongoing Bleed (调后持续失血): High spend with 0 orders in recent 3d, or ACOS doubled
-            elif (c["spend_3d"] >= 15 and c["ord_3d"] == 0) or (c["spend"] >= 15 and c["ord"] == 0 and c["spend_7d"] >= 10):
-                assessment = "CIRCUIT_BREAKER_BLEED"
-                recom = f"[调后持续失血·紧急纠偏] 调整后近3天花费 ${c['spend_3d']:.1f} 仍为 0 单 (7天花 ${c['spend_7d']:.1f})；上次幅度不足或词流未阻断，打破观察期，二次削减 TOS/PP 溢价或下调基础竞价"
-            elif c["ord_3d"] > 0 and c["spend_3d"] >= 25 and c["acos_3d"] >= (target_acos * 2.0):
-                assessment = "CIRCUIT_BREAKER_BLEED"
-                recom = f"[调后持续失血·ACOS爆表] 近3天 ACOS 达 {c['acos_3d']:.1f}% (目标 {target_acos:.0f}%)；打破观察期，紧急下调基础竞价防守"
-
-            # 3. Post-adjustment Effective (调后生效·见效保持): CPC dropped significantly, volume stable
-            elif c["delta_cpc_pct"] <= -15.0 and c["delta_imp_pct"] > -60.0:
+            # Post-adjustment Effective (调后生效·见效保持): CPC dropped significantly, volume stable
+            if c["delta_cpc_pct"] <= -15.0 and c["delta_imp_pct"] > -60.0:
                 assessment = "ADJUSTMENT_EFFECTIVE"
                 recom = f"[调后生效·见效保持] 近3天 CPC 成功压至 ${c['cpc_3d']:.2f} ({c['delta_cpc_pct']:+.1f}% vs 30天均值 ${c['cpc']:.2f})，曝光量稳定；调整已见成效，严禁二次砍价！保持当前稳态运行"
-
-            # 4. Normal Monitoring (指标在公差范围内)
             else:
                 assessment = "IN_OBSERVATION"
                 recom = f"[动态观察期 Day {elapsed}/{args.cooldown_days}·正常公差] {detail}；近3天 CPC ${effective_cpc:.2f} (变动 {c['delta_cpc_pct']:+.1f}%)，指标在合理公差内，保持监控"
 
         elif c["spend"] >= 60 and c["ord"] == 0 and c["tos"] >= 50:
             assessment = "DEAD_CAMPAIGN_CANDIDATE"
-            recom = f"30天花费 ${c['spend']:.1f} 仍为 0 单，近7天 CPC ${effective_cpc:.2f}；确诊为算法冷宫死活动，建议执行归档并按净水器协议新建精准仓"
+            recom = f"30天花费 ${c['spend']:.1f} 仍为 0 单，近7天 CPC ${effective_cpc:.2f}；确诊为算法冷宫死活动，建议执行归档并按重生协议新建精准仓"
         elif c["tos"] >= 150:
             assessment = "HIGH_TOS_RISK"
             recom = f"TOS {int(c['tos'])}% 虚高，近7天实际 CPC ${effective_cpc:.2f}；下调 TOS 至 50-80% 消除暴涨风险，若曝光下跌则回补基础竞价"
@@ -2049,11 +2310,12 @@ def main() -> None:
         placement_lines,
     )
 
-    # Load searchrank map from keyword_analysis.json (Amazon ABA search rank)
-    sr_map = load_searchrank_map(src)
 
-    # 3. Output keywords.tsv (with Searchrank and Volume Tier)
+def write_keywords_tsv(dest, kws, sr_map, xydc_map=None):
+    """keywords.tsv -- targeted keywords with ABA searchrank, volume tier, and organic/ad rank synergy."""
+    # 3. Output keywords.tsv (with Searchrank, Volume Tier, and Rank Synergy)
     kw_lines = []
+    xydc_map = xydc_map or {}
     for r in sorted(kws, key=lambda x: -num(x.get("spends"))):
         spend = num(r.get("spends"))
         if spend < 1 and num(r.get("orders")) < 1:
@@ -2061,6 +2323,20 @@ def main() -> None:
         kw_text = r.get("keyword_text") or r.get("targeting_text") or ""
         sr, v_tier = get_searchrank(kw_text, sr_map)
         sr_display = str(sr) if sr is not None else "--"
+
+        eval_res = evaluate_rank_synergy(
+            term=kw_text,
+            xydc_map=xydc_map,
+            spend=spend,
+            sales=num(r.get("sales")),
+            orders=int(num(r.get("orders"))),
+            clicks=int(num(r.get("clicks"))),
+            target_acos=num(r.get("acos")) or 25.0,
+            current_bid=num(r.get("bid")),
+        )
+        org_rank_str = str(eval_res["organic_rank"]) if eval_res["organic_rank"] is not None else "--"
+        sp_rank_str = str(eval_res["sp_rank"]) if eval_res["sp_rank"] is not None else "--"
+
         kw_lines.append("\t".join(str(x) for x in [
             r.get("campaign_name"), r.get("match_type"), kw_text,
             sr_display, v_tier,
@@ -2068,13 +2344,17 @@ def main() -> None:
             round(spend, 2), round(num(r.get("sales")), 2), round(num(r.get("acos")), 1),
             int(num(r.get("orders"))), int(num(r.get("clicks"))),
             round(num(r.get("cvr")), 1), round(num(r.get("cpc")), 2), round(num(r.get("ctr")), 2),
+            org_rank_str, sp_rank_str, eval_res["synergy_tier"], eval_res["synergy_tag"],
         ]))
     tsv(
         dest / "keywords.tsv",
-        "campaign\tmatch\ttext\tsearchrank\tvolume_tier\tbid\tdefbid\tstate\tspend\tsales\tacos\tord\tclk\tcvr\tcpc\tctr",
+        "campaign\tmatch\ttext\tsearchrank\tvolume_tier\tbid\tdefbid\tstate\tspend\tsales\tacos\tord\tclk\tcvr\tcpc\tctr\torganic_rank\tsp_rank\tsynergy_tier\tsynergy_tag",
         kw_lines,
     )
 
+
+def analyze_search_terms(asin_campaigns, camps, known_negatives, kws, kws_3d, kws_7d, profile, rules, sr_map, src, target_acos, xydc_map=None):
+    """The core pass: classify queries, fingerprint placement, and build the raw adjustment list."""
     # 4. Search terms, N-Grams, Active Negatives, and Cannibalization Analysis
     sts = [r for r in as_rows(load_json(src / "search_terms.json")) if r.get("query") or r.get("campaign_name")]
     if asin_campaigns:
@@ -2082,7 +2362,7 @@ def main() -> None:
 
     active_neg_dict, active_neg_camp_pairs, all_neg_queries = extract_active_negatives(sts)
     audit_records, unnegative_adjustments = audit_active_negatives(
-        active_neg_dict, profile, rules, sr_map, kws=kws, camps=camps
+        active_neg_dict, profile, rules, sr_map, kws=kws, camps=camps, xydc_map=xydc_map
     )
     kw_misfit_adjustments = audit_keyword_misfits(kws, rules, camps=camps)
 
@@ -2112,6 +2392,23 @@ def main() -> None:
         if txt:
             kw_3d_map[(cn, mt, txt)] = k
 
+    # Build ad group default bid lookup to inherit parent group bids when keyword bid is null
+    raw_ad_groups = as_rows(load_json(src / "ad_groups.json"))
+    group_bid_lookup = {}
+    camp_group_bid_lookup = {}
+    for g in raw_ad_groups:
+        cn = g.get("campaign_name") or ""
+        gn = g.get("name") or g.get("ad_group_name") or ""
+        gid = str(g.get("ad_group_id") or "")
+        dbid = num(g.get("default_bid"))
+        if dbid > 0:
+            if gid:
+                group_bid_lookup[gid] = dbid
+            if cn and gn:
+                group_bid_lookup[(cn, gn)] = dbid
+            if cn and (cn not in camp_group_bid_lookup or dbid > camp_group_bid_lookup[cn]):
+                camp_group_bid_lookup[cn] = dbid
+
     # Build lookups for placement fingerprinting and fresh slice verification
     kw_lookup = {}
     for k in kws:
@@ -2124,8 +2421,13 @@ def main() -> None:
         k7 = kw_7d_map.get((c_name_k, match_k, text_k), {})
         k3 = kw_3d_map.get((c_name_k, match_k, text_k), {})
 
-        # Current bid: prefer latest report (3d -> 7d -> baseline)
-        current_bid = num(k3.get("bid") or k7.get("bid") or k.get("bid") or k.get("default_bid"))
+        # Current bid: prefer latest report (3d -> 7d -> baseline -> inherited ad group default bid)
+        gid_k = str(k.get("ad_group_id") or "")
+        gn_k = k.get("ad_group_name") or ""
+        inherited_bid = group_bid_lookup.get(gid_k) or group_bid_lookup.get((c_name_k, gn_k)) or camp_group_bid_lookup.get(c_name_k, 0.30)
+        current_bid = num(k3.get("bid") or k7.get("bid") or k.get("bid"))
+        if current_bid <= 0:
+            current_bid = inherited_bid
         current_state = str(k3.get("state") or k7.get("state") or k.get("state") or "enabled").lower().strip()
 
         imp_30d = int(num(k.get("impressions")))
@@ -2168,6 +2470,8 @@ def main() -> None:
         }
 
     camp_lookup = {c["name"]: c for c in camps if c.get("name")}
+    # Fixed for the whole run -- resolve once instead of rescanning per search term.
+    harvest_camp = find_exact_harvest_campaign(camps, kws)
     placement_diagnoses = []
 
     for r in sorted(sts, key=lambda x: -num(x.get("spends"))):
@@ -2214,11 +2518,33 @@ def main() -> None:
             "cpc": num(r.get("cpc")),
         })
 
+        # Rank synergy evaluation
+        eval_st = evaluate_rank_synergy(
+            term=q,
+            xydc_map=xydc_map or {},
+            spend=spend,
+            sales=sales,
+            orders=int(ordn),
+            clicks=int(clk),
+            target_acos=target_acos or 25.0,
+        )
+        st_org_rank = eval_st.get("organic_rank")
+        st_sp_rank = eval_st.get("sp_rank")
+        st_org_rank_str = str(st_org_rank) if st_org_rank is not None else "--"
+        st_sp_rank_str = str(st_sp_rank) if st_sp_rank is not None else "--"
+        if st_org_rank is not None or st_sp_rank is not None:
+            rank_tag = f"[自然位#{st_org_rank_str}·广告位#{st_sp_rank_str} {eval_st.get('synergy_tag', '')}] "
+            rank_cur_desc = f"(自然位#{st_org_rank_str}, 广告位#{st_sp_rank_str}) "
+        else:
+            rank_tag = "[西柚未建位/暂无排名] "
+            rank_cur_desc = "(西柚未建位) "
+
         if spend >= 3 or ordn >= 1:
             st_lines.append("\t".join(str(x) for x in [
                 bucket, v_tier, sr_display, c_name, q, match_type, target_text,
                 round(spend, 2), round(sales, 2), round(num(r.get("acos")), 1),
                 int(ordn), int(clk), round(num(r.get("cvr")), 1), round(num(r.get("cpc")), 2),
+                st_org_rank_str, st_sp_rank_str, eval_st["synergy_tier"],
             ]))
 
         # Multi-dimensional placement fingerprint diagnosis
@@ -2244,7 +2570,10 @@ def main() -> None:
             placement_diagnoses.append(diag)
 
         # Search term optimization & placement-based dynamic adjustment
-        is_already_negated = (c_name.lower(), q.lower()) in active_neg_camp_pairs or any(kn == q.lower() or kn in q.lower() for kn in known_negatives)
+        is_already_negated = (
+            (c_name.lower(), q.lower()) in active_neg_camp_pairs
+            or is_known_negative(q, known_negatives)
+        )
 
         if diag.get("action_type") and not is_already_negated:
             action_code = diag["action_type"]
@@ -2277,20 +2606,20 @@ def main() -> None:
                     if not kw_info["has_active_bleeding"] and kw_info["spend_3d"] == 0.0 and kw_info["spend_7d"] < 2.0:
                         continue
 
-                    # Guardrail 5: Bid floor protection
-                    if actual_base_bid <= 0.20:
+                    # Guardrail 5: Bid floor protection (raised to $0.25 to prevent sub-auction blackout)
+                    if actual_base_bid <= 0.25:
                         continue
 
-                    new_bid = max(0.18, round(actual_base_bid * 0.75, 2))
+                    new_bid = max(0.22, round(actual_base_bid * 0.75, 2))
                     waste.append(f"{q}\t{c_name}\tspend={spend:.2f}\tclk={int(clk)}\tctr={diag['ctr']}%\tcpc=${diag['cpc']:.2f}\tpos={diag['inferred_placement']}\ttag={diag['strategy_tag']}\taction={action_code}")
                     bulk_adjustments.append({
                         "action_type": "Throttle_TOS_Bid",
                         "campaign": c_name,
                         "target_entity": q,
                         "match_type": actual_match,
-                        "current_value": f"投放词 (当前基础竞价 ${actual_base_bid:.2f}), 30天花费=${spend:.2f}({int(clk)}点击0单), 近3天花费=${kw_info['spend_3d']:.2f}, CPC=${diag['cpc']:.2f} [{diag['inferred_placement']}]",
+                        "current_value": f"投放词 {rank_cur_desc}(当前基础竞价 ${actual_base_bid:.2f}), 30天花费=${spend:.2f}({int(clk)}点击0单), 近3天花费=${kw_info['spend_3d']:.2f}, CPC=${diag['cpc']:.2f} [{diag['inferred_placement']}]",
                         "recommended_value": f"基础竞价下调 25% 至 ${new_bid:.2f}",
-                        "reason": f"投放关键词在首页顶部黄金位近期仍在活跃流血（近3天花费 ${kw_info['spend_3d']:.2f}），且历史累计 {int(clk)} 次高意图点击仍未转化，下调基础竞价退守防守位避损。",
+                        "reason": f"{rank_tag}投放关键词在首页顶部黄金位近期仍在活跃流血（近3天花费 ${kw_info['spend_3d']:.2f}），且历史累计 {int(clk)} 次高意图点击仍未转化，下调基础竞价退守防守位避损。",
                     })
                 elif action_code == "Elevate_To_TOS":
                     new_bid = round(actual_base_bid * 1.15, 2)
@@ -2299,9 +2628,9 @@ def main() -> None:
                         "campaign": c_name,
                         "target_entity": q,
                         "match_type": actual_match,
-                        "current_value": f"投放词 (当前基础竞价 ${actual_base_bid:.2f}), 花费=${spend:.2f}, 点击={int(clk)}, CTR={diag['ctr']:.2f}% [{diag['inferred_placement']}]",
+                        "current_value": f"投放词 {rank_cur_desc}(当前基础竞价 ${actual_base_bid:.2f}), 花费=${spend:.2f}, 点击={int(clk)}, CTR={diag['ctr']:.2f}% [{diag['inferred_placement']}]",
                         "recommended_value": f"基础竞价提高 15% 至 ${new_bid:.2f} 或提升活动 TOS%",
-                        "reason": f"核心投放词在详情页/底部位受抑，提权专打首屏黄金位测试真实转化潜力。",
+                        "reason": f"{rank_tag}核心投放词在详情页/底部位受抑，提权专打首屏黄金位测试真实转化潜力。",
                     })
                 elif action_code == "Negative_Exact":
                     bulk_adjustments.append({
@@ -2309,55 +2638,102 @@ def main() -> None:
                         "campaign": c_name,
                         "target_entity": q,
                         "match_type": "negativeExact",
-                        "current_value": f"投放词, 花费=${spend:.2f}, 点击={int(clk)}, 0订单",
+                        "current_value": f"投放词 {rank_cur_desc}花费=${spend:.2f}, 点击={int(clk)}, 0订单",
                         "recommended_value": f"在活动 {c_name} 添加精准否定 (Negative Exact)",
-                        "reason": diag["diagnostic_reason"],
+                        "reason": f"{rank_tag}{diag['diagnostic_reason']}",
                     })
             else:
                 # q is NOT a targeted keyword in c_name; it is a customer query triggered by broad/auto/phrase
                 if action_code in ("Throttle_TOS_Bid", "Lower_Bid", "Negative_Exact"):
+                    # Rule 11 Core Functional Query Protection:
+                    # If this is a core hero term / primary functional asset, DO NOT blindly add Negative_Exact in Broad/Auto!
+                    # Only negate peripheral, adjacent, or hard misfit queries!
+                    is_core_hero = bucket in ("brand", "core", "core_feature", "core_or_title") or is_strong_relevance
+                    if is_core_hero and action_code == "Throttle_TOS_Bid":
+                        harvest_camp_obj = camp_lookup.get(harvest_camp, {})
+                        if harvest_camp_obj.get("state") == "enabled":
+                            target_cpc = diag.get("cpc", 0.0) or (spend / max(1, clk))
+                            defensive_bid = max(0.25, round(target_cpc * 0.70, 2))
+                            bulk_adjustments.append({
+                                "action_type": "Harvest_To_Exact",
+                                "campaign": c_name,
+                                "target_entity": q,
+                                "match_type": "exact",
+                                "current_value": f"核心买家搜索词 {rank_cur_desc}(触发投放词: {target_text}), 花费=${spend:.2f}, 点击={int(clk)}, 0订单 [{diag['inferred_placement']}]",
+                                "recommended_value": f"移入精准仓 ({harvest_camp}) 独立出防守竞价 ${defensive_bid:.2f}，在广泛仓降溢价而非盲目否定",
+                                "reason": f"{rank_tag}核心主粮词在广泛仓顶部耗损；严禁一刀切精准否定斩断自然权重，应移入专用精准仓出防守竞价可控收割，并排查首屏转化壁垒。",
+                            })
+                        continue
+
                     waste.append(f"{q}\t{c_name}\tspend={spend:.2f}\tclk={int(clk)}\tctr={diag['ctr']}%\tcpc=${diag['cpc']:.2f}\tpos={diag['inferred_placement']}\ttag={diag['strategy_tag']}\taction=Negative_Exact")
                     bulk_adjustments.append({
                         "action_type": "Negative_Exact",
                         "campaign": c_name,
                         "target_entity": q,
                         "match_type": "negativeExact",
-                        "current_value": f"买家搜索词 (触发投放词: {target_text} [{match_type}]), 花费=${spend:.2f}, 点击={int(clk)}, 0订单 [{diag['inferred_placement']}]",
+                        "current_value": f"买家搜索词 {rank_cur_desc}(触发投放词: {target_text} [{match_type}]), 花费=${spend:.2f}, 点击={int(clk)}, 0订单 [{diag['inferred_placement']}]",
                         "recommended_value": f"在活动 {c_name} 添加精准否定 (Negative Exact)",
-                        "reason": f"买家搜索词由广泛/自动投放词匹配触发，非独立投放词，无法直接调竞价；在首屏顶部已高耗损未转化，应在活动 {c_name} 中精准否定以阻断流血。",
+                        "reason": f"{rank_tag}买家搜索词由广泛/自动投放词匹配触发，非独立投放词，无法直接调竞价；在首屏顶部已高耗损未转化，应在活动 {c_name} 中精准否定以阻断流血。",
                     })
                 elif action_code in ("Elevate_To_TOS", "Refine_Bid_Placement"):
-                    harvest_camp = find_exact_harvest_campaign(camps, kws)
+                    if bucket in ("is_not", "competitor_brand", "adjacent") or str(bucket).startswith("is_not"):
+                        continue
                     harvest_camp_obj = camp_lookup.get(harvest_camp, {})
-                    if harvest_camp_obj.get("state") == "enabled":
+                    if harvest_camp_obj.get("state") == "enabled" and c_name != harvest_camp and "exact" not in c_name.lower():
+                        target_cpc = diag.get("cpc", 0.0) or (spend / max(1, clk))
+                        recom_bid, eff_tos, bid_calc_desc = calc_dynamic_migration_bid(
+                            {"cpc": target_cpc, "spend": spend, "orders": ordn},
+                            harvest_camp, camp_lookup, prior_target=None
+                        )
                         bulk_adjustments.append({
                             "action_type": "Harvest_To_Exact",
-                            "campaign": c_name,
+                            "campaign": harvest_camp,
                             "target_entity": q,
                             "match_type": "exact",
-                            "current_value": f"买家搜索词 (触发投放词: {target_text} [{match_type}]), 花费=${spend:.2f}, 点击={int(clk)}, CTR={diag['ctr']:.2f}% [{diag['inferred_placement']}]",
-                            "recommended_value": f"在原活动精准否定防内耗，移入专用精准仓 ({harvest_camp}) 独立出价测试首屏",
-                            "reason": f"优质买家搜索词在广泛仓被困在低效展示位，无法单独为其加价；应移入精准仓独立控制基础竞价与溢价专打顶部，并在广泛仓精准否定防内耗。",
+                            "current_value": f"Broad query in {c_name} {rank_cur_desc}(CPC ${target_cpc:.2f})",
+                            "recommended_value": f"${recom_bid:.2f}",
+                            "reason": f"{rank_tag}优质买家搜索词在广泛仓低效位受抑；移入专用精准仓 ({harvest_camp}) 独立出价测试首屏。{bid_calc_desc}",
                         })
 
-        # High-potential winning query (harvest)
-        if ordn >= 5 and acos(spend, sales) <= target_acos and spend >= 12:
+        # High-potential winning query (harvest) - strictly exclude IS_NOT, adjacent, and competitor brands!
+        if (
+            ordn >= 5
+            and acos(spend, sales) <= target_acos
+            and spend >= 12
+            and bucket not in ("is_not", "competitor_brand", "adjacent")
+            and not str(bucket).startswith("is_not")
+        ):
             camp_obj = camp_lookup.get(c_name, {})
-            if camp_obj.get("state") == "enabled":
+            harvest_camp_obj = camp_lookup.get(harvest_camp, {})
+            if (
+                camp_obj.get("state") == "enabled"
+                and harvest_camp_obj.get("state") == "enabled"
+                and c_name != harvest_camp
+                and "exact" not in c_name.lower()
+            ):
                 harvest.append(f"{q}\t{c_name}\tspend={spend:.2f}\tacos={acos(spend,sales):.1f}\tord={int(ordn)}\tbucket={bucket}\ttier={v_tier}")
+                target_cpc = round(spend / max(1, clk), 2)
+                recom_bid, eff_tos, bid_calc_desc = calc_dynamic_migration_bid(
+                    {"cpc": target_cpc, "spend": spend, "orders": ordn},
+                    harvest_camp, camp_lookup, prior_target=None
+                )
                 bulk_adjustments.append({
-                    "action_type": "Harvest_Exact",
-                    "campaign": c_name,
+                    "action_type": "Harvest_To_Exact",
+                    "campaign": harvest_camp,
                     "target_entity": q,
                     "match_type": "exact",
-                    "current_value": f"orders={int(ordn)}, acos={acos(spend,sales):.1f}%",
-                    "recommended_value": "Promote to Dedicated Exact Campaign",
-                    "reason": f"Proven conversion engine (orders={int(ordn)}, acos={acos(spend,sales):.1f}% <= target {target_acos:.0f}%), bucket: {bucket}, tier: {v_tier}",
+                    "current_value": f"{rank_cur_desc}30天表现: orders={int(ordn)}, acos={acos(spend,sales):.1f}% in {c_name}",
+                    "recommended_value": f"${recom_bid:.2f}",
+                    "reason": f"{rank_tag}高转化赢家词收割至精准仓：在原活动保持或精准否定防内耗，移入 {harvest_camp} 独立收割。{bid_calc_desc}",
                 })
 
+    return active_neg_dict, all_neg_queries, audit_records, bucket_stats, bulk_adjustments, camp_lookup, cannibal_map, harvest, kw_misfit_adjustments, ngram_stats, placement_diagnoses, st_lines, unnegative_adjustments, waste
+
+def write_search_term_outputs(args, dest, gen_time_str, harvest, meta, placement_diagnoses, profile, st_lines, waste):
+    """search_terms.tsv, waste.txt, harvest.txt and the placement diagnosis tables."""
     tsv(
         dest / "search_terms.tsv",
-        "bucket\tcampaign\tquery\tmatch\ttarget\tspend\tsales\tacos\tord\tclk\tcvr\tcpc",
+        "bucket\tvolume_tier\tsearchrank\tcampaign\tquery\tmatch\ttarget\tspend\tsales\tacos\tord\tclk\tcvr\tcpc\torganic_rank\tsp_rank\tsynergy_tier",
         st_lines,
     )
     dest.joinpath("waste.txt").write_text("\n".join(waste), encoding="utf-8")
@@ -2393,6 +2769,98 @@ def main() -> None:
             diag_lines,
         )
 
+
+def write_rank_synergy_tsv(args, dest, gen_time_str, kws, meta, profile, target_acos, xydc_map):
+    """Output rank_synergy.tsv -- comprehensive mapping of organic rank vs ad rank (西柚洞察)."""
+    if not xydc_map:
+        return []
+
+    # Aggregate actual 30d ad performance by query/target
+    kw_perf = defaultdict(lambda: {"spend": 0.0, "sales": 0.0, "ord": 0, "clk": 0, "camps": set(), "bids": []})
+    for k in kws:
+        t = (k.get("keyword_text") or k.get("targeting_text") or "").strip().lower()
+        if not t:
+            continue
+        kw_perf[t]["spend"] += num(k.get("spends"))
+        kw_perf[t]["sales"] += num(k.get("sales"))
+        kw_perf[t]["ord"] += int(num(k.get("orders")))
+        kw_perf[t]["clk"] += int(num(k.get("clicks")))
+        if k.get("campaign_name"):
+            kw_perf[t]["camps"].add(k.get("campaign_name"))
+        b = num(k.get("bid"))
+        if b > 0:
+            kw_perf[t]["bids"].append(b)
+
+    synergy_rows = []
+    sorted_kws = sorted(xydc_map.keys(), key=lambda k: -xydc_map[k].get("total_traffic", 0.0))
+
+    for kw in sorted_kws:
+        item = xydc_map[kw]
+        perf = kw_perf.get(kw, {"spend": 0.0, "sales": 0.0, "ord": 0, "clk": 0, "camps": set(), "bids": []})
+        sp = perf["spend"]
+        sa = perf["sales"]
+        od = perf["ord"]
+        ck = perf["clk"]
+        cur_bid = min(perf["bids"]) if perf["bids"] else 0.0
+
+        eval_res = evaluate_rank_synergy(
+            term=kw,
+            xydc_map=xydc_map,
+            spend=sp,
+            sales=sa,
+            orders=od,
+            clicks=ck,
+            target_acos=target_acos or 25.0,
+            current_bid=cur_bid,
+        )
+
+        org_rank_str = str(eval_res["organic_rank"]) if eval_res["organic_rank"] is not None else "--"
+        sp_rank_str = str(eval_res["sp_rank"]) if eval_res["sp_rank"] is not None else "--"
+        ad_acos_str = f"{acos(sp, sa):.1f}%" if sa > 0 else ("--" if sp == 0 else "999.0%")
+        ad_cvr_str = f"{(od / ck * 100):.1f}%" if ck > 0 else "--"
+        ad_cpc_str = f"${(sp / ck):.2f}" if ck > 0 else "--"
+        campaigns_str = "; ".join(list(perf["camps"])[:2]) if perf["camps"] else "--"
+
+        synergy_rows.append("\t".join(str(x) for x in [
+            kw,
+            org_rank_str,
+            sp_rank_str,
+            round(eval_res["organic_traffic"], 1),
+            round(eval_res["ad_traffic"], 1),
+            round(eval_res["total_traffic"], 1),
+            f"{eval_res['organic_rate'] * 100:.1f}%",
+            f"{eval_res['ad_rate'] * 100:.1f}%",
+            campaigns_str,
+            round(sp, 2),
+            round(sa, 2),
+            ad_acos_str,
+            od,
+            ck,
+            ad_cvr_str,
+            ad_cpc_str,
+            eval_res["synergy_tier"],
+            eval_res["synergy_tag"],
+            eval_res["recommended_value"],
+            eval_res["reason"],
+        ]))
+
+    headers = "query\torganic_rank\tsp_rank\torganic_traffic\tad_traffic\ttotal_traffic\torganic_share\tad_share\tactive_campaigns\tad_spend\tad_sales\tad_acos\tad_orders\tad_clicks\tad_cvr\tad_cpc\tsynergy_tier\tsynergy_tag\trecommended_value\treason"
+    tsv(dest / "rank_synergy.tsv", headers, synergy_rows)
+    tsv(dest / f"rank_synergy_{gen_time_str}.tsv", headers, synergy_rows)
+
+    if args.export_dir:
+        exp_dir = Path(args.export_dir)
+        exp_dir.mkdir(parents=True, exist_ok=True)
+        asin_str = str(meta.get("asin") or profile.get("asin") or "UNKNOWN").upper()
+        country_str = str(meta.get("country") or "US").upper()
+        tsv(exp_dir / f"{asin_str}-{country_str}-rank-synergy-{gen_time_str}.tsv", headers, synergy_rows)
+        tsv(exp_dir / f"{asin_str}-{country_str}-rank-synergy.tsv", headers, synergy_rows)
+
+    return synergy_rows
+
+
+def write_buckets_tsv(bucket_stats, dest):
+    """buckets.tsv -- spend and conversion rolled up by intent bucket."""
     # 5. Output buckets.tsv
     b_lines = ["bucket\tspend\tsales\tacos\tord\tclk\tcvr"]
     for b, v in sorted(bucket_stats.items(), key=lambda kv: -kv[1]["spend"]):
@@ -2403,6 +2871,9 @@ def main() -> None:
         ]))
     dest.joinpath("buckets.tsv").write_text("\n".join(b_lines), encoding="utf-8")
 
+
+def write_ngram_outputs(all_neg_queries, bulk_adjustments, dest, known_negatives, ngram_stats, profile, rules):
+    """ngrams.tsv and bleeding_ngrams.txt, appending negative-phrase adjustments."""
     # 6. Output ngrams.tsv & bleeding_ngrams.txt
     title_str = str(profile.get("title") or "").lower()
     title_tokens = {t for t in re.findall(r"[\w]+", title_str, re.UNICODE) if len(t) > 2 and not t.isdigit() and t not in STOP_WORDS}
@@ -2438,7 +2909,7 @@ def main() -> None:
 
             # Deduplication: Check if this root phrase is already negated or in known_negatives
             all_queries_negated = all(q_item.lower() in all_neg_queries for q_item in stat["queries"])
-            is_known_neg = ng.lower() in known_negatives or any(kn == ng.lower() or kn in ng.lower() for kn in known_negatives)
+            is_known_neg = is_known_negative(ng, known_negatives)
             if ng.lower() in all_neg_queries or all_queries_negated or is_known_neg:
                 bleeding_ng.append(f"{ng}\tspend=${sp:.2f}\tclk={int(ck)}\tqueries_count={len(stat['queries'])}\ttype={stat['gram_type']}\tALREADY_NEGATED")
                 continue
@@ -2449,9 +2920,9 @@ def main() -> None:
                 "campaign": "ALL_NON_EXACT",
                 "target_entity": ng,
                 "match_type": "negativePhrase",
-                "current_value": f"cum_spend=${sp:.2f}, 0 orders across {len(stat['queries'])} queries",
+                "current_value": f"[词根词组否定·非单独立词] 累计花费=${sp:.2f}, {int(ck)}点击0订单 (覆盖{len(stat['queries'])}个搜索词)",
                 "recommended_value": "Add Negative Phrase to Broad/Auto Campaigns",
-                "reason": f"Bleeding root phrase: wasted ${sp:.2f} with 0 orders",
+                "reason": f"[高耗词根词组否定] 词根累计花费 ${sp:.2f} 且 0 转化，在全账户广泛/自动仓添加词组否定止血。",
             })
 
     tsv(
@@ -2461,6 +2932,10 @@ def main() -> None:
     )
     dest.joinpath("bleeding_ngrams.txt").write_text("\n".join(bleeding_ng), encoding="utf-8")
 
+    return bleeding_ng
+
+def write_cannibalization_tsv(cannibal_map, dest):
+    """cannibalization.tsv -- queries competing across more than one campaign."""
     # 7. Output cannibalization.tsv
     cannibal_lines = []
     for q_text, occurrences in sorted(cannibal_map.items(), key=lambda kv: -sum(x["spend"] for x in kv[1])):
@@ -2471,7 +2946,6 @@ def main() -> None:
         if total_sp < 2 and total_od == 0:
             continue
 
-        c_names = [x["campaign"] for x in occurrences]
         # Check risk: e.g. Exact vs Broad/Phrase/Auto competing
         risk = "NORMAL_OVERLAP"
         has_exact = any("exact" in str(x["match"]).lower() or "精准" in x["campaign"] or "exact" in x["campaign"].lower() for x in occurrences)
@@ -2499,6 +2973,10 @@ def main() -> None:
         cannibal_lines,
     )
 
+    return cannibal_lines
+
+def write_groups_tsv(asin_campaigns, dest, src):
+    """groups.tsv -- ad group level performance."""
     # 8. Output groups.tsv
     groups = as_rows(load_json(src / "ad_groups.json"))
     if asin_campaigns:
@@ -2520,6 +2998,9 @@ def main() -> None:
         g_lines,
     )
 
+
+def write_targets_tsv(bulk_adjustments, camp_lookup, dest, profile, target_acos, targets):
+    """targets.tsv -- product targets with competitor profile and competitiveness verdict."""
     # 9. Output targets.tsv (with Competitor Profile and Competitiveness Evaluation)
     t_lines = []
     for r in sorted(targets, key=lambda x: -num(x.get("spends"))):
@@ -2543,9 +3024,9 @@ def main() -> None:
                         "campaign": c_info["campaign_name"],
                         "target_entity": c_info["asin"],
                         "match_type": "asinSameAs",
-                        "current_value": f"spend=${c_info['spend']:.2f}, ord={c_info['orders']}, comp_price=${c_info['price']:.2f} vs our=${profile.get('price')}",
+                        "current_value": f"[竞品ASIN投放·无关键词位] 花费=${c_info['spend']:.2f}, 订单={c_info['orders']}, 竞品价=${c_info['price']:.2f} vs 本品=${profile.get('price')}",
                         "recommended_value": rec_val,
-                        "reason": reason_text,
+                        "reason": f"[竞品ASIN投放] {reason_text}",
                     })
         t_lines.append("\t".join(str(x) for x in [
             r.get("campaign_name"), r.get("exp_type_zh") or r.get("exp_type_text") or r.get("match_type"),
@@ -2562,6 +3043,9 @@ def main() -> None:
         t_lines,
     )
 
+
+def write_negative_tsvs(active_neg_dict, audit_records, dest):
+    """active_negatives.tsv, active_negatives_audit.tsv and unnegative_recommendations.tsv."""
     # 10. Output active_negatives.tsv, active_negatives_audit.tsv, unnegative_recommendations.tsv
     active_neg_lines = []
     for (c_name, ql), item in sorted(active_neg_dict.items(), key=lambda kv: -kv[1]["spend"]):
@@ -2611,14 +3095,54 @@ def main() -> None:
         unneg_lines,
     )
 
+
+def assemble_and_write_adjustments(args, bulk_adjustments, camps, dayparting_records, dayparting_table_lines, dest, financial_prof, gen_time_str, kw_misfit_adjustments, locked_campaigns, meta, profile, target_acos, traffic_prof, unnegative_adjustments, kws=None, xydc_map=None):
+    """Merge every adjustment source, apply the cooldown lock, dedupe, and write bulk_adjustments.tsv."""
     # 11. Output bulk_adjustments.tsv (Consolidated & Deduplicated with Cooling-off Lock Filter)
     all_final_adjustments = []
+
+    # Build ad group default bid lookup for exact numerical recovery recommendations
+    raw_ad_groups = as_rows(load_json(Path(args.indir) / "ad_groups.json"))
+    camp_base_bid_map = {}
+    for g in raw_ad_groups:
+        cn = g.get("campaign_name") or ""
+        dbid = num(g.get("default_bid"))
+        if dbid > 0 and cn and (cn not in camp_base_bid_map or dbid > camp_base_bid_map[cn]):
+            camp_base_bid_map[cn] = dbid
+
+    # Extract organic readiness to safeguard fragile listings
+    organic_readiness = traffic_prof.get("organic_readiness", "ORGANIC_BALANCED") if traffic_prof else "ORGANIC_BALANCED"
+    is_fragile = (organic_readiness == "ORGANIC_FRAGILE")
 
     # 11.1 Placement adjustments (only if not locked in cooling-off, UNLESS circuit breaker triggered)
     for c in camps:
         if c["state"] != "enabled":
             continue
         c_assessment = c.get("assessment", "")
+
+        # Shock Recovery: Regardless of locked status, if in shock, MUST probe recover!
+        if c_assessment == "CIRCUIT_BREAKER_SHOCK":
+            base_val = camp_base_bid_map.get(c["name"], 0.30)
+            baseline_cpc = c.get("cpc") or 0.50
+            current_tos = c.get("tos", 0)
+            # Mathematically anchor recovery bid to pre-shock clearing price
+            target_clearing_bid = round(baseline_cpc / (1.0 + (current_tos / 100.0)), 2)
+            # Recovery bid must clear the auction threshold
+            probe_val = max(round(base_val * 1.15, 2), round(base_val + 0.05, 2))
+            if target_clearing_bid > probe_val:
+                probe_val = min(target_clearing_bid, round(base_val * 1.60, 2), round(baseline_cpc, 2))
+            probe_val = max(0.25, probe_val)
+            all_final_adjustments.append({
+                "action_type": "Probe_Bid_Recovery",
+                "campaign": c["name"],
+                "target_entity": "CampaignBaseBid",
+                "match_type": "bidding",
+                "current_value": f"${base_val:.2f}",
+                "recommended_value": f"${probe_val:.2f}",
+                "reason": f"AI 熔断纠偏：调后休克断流（近3天日均曝光暴跌 {c.get('delta_imp_pct', 0):+.1f}%），基于基线CPC ${baseline_cpc:.2f}与当前TOS {current_tos:.0f}%倒推回提基础竞价至 ${probe_val:.2f} 探底拉回展示池。",
+            })
+            continue
+
         if c["name"] in locked_campaigns:
             if c_assessment == "CIRCUIT_BREAKER_BLEED":
                 if c["tos"] >= 120:
@@ -2641,19 +3165,80 @@ def main() -> None:
                         "recommended_value": "PP=20%",
                         "reason": f"AI Circuit Breaker: PP bleeding during observation (${c['spend']:.1f}, acos={c['acos']:.1f}%), emergency throttle",
                     })
-            elif c_assessment == "CIRCUIT_BREAKER_SHOCK":
-                all_final_adjustments.append({
-                    "action_type": "Probe_Bid_Recovery",
-                    "campaign": c["name"],
-                    "target_entity": "CampaignBaseBid",
-                    "match_type": "bidding",
-                    "current_value": "Current Lowered Bid",
-                    "recommended_value": "+10% ~ +15% Step-up Bid Probe (or +$0.05)",
-                    "reason": f"AI Circuit Breaker: Post-adjustment asphyxiation (recent 3d imp plunged {c.get('delta_imp_pct', 0):+.1f}%), step-up probe to recover traffic pool",
-                })
             continue
 
-        if c["tos"] >= 150:
+        c_lower = c["name"].lower()
+        is_auto = "自动" in c["name"] or c.get("targeting") == "auto" or "auto" in c_lower
+        is_exact = "exact" in c_lower or "精准" in c["name"]
+        is_comp = any(x in c_lower for x in ["substitute", "asin", "同类", "关联", "comp", "defense"]) or c.get("targeting") == "targets"
+        is_broad = "广泛" in c["name"] or "broad" in c_lower
+
+        # Rule 27 & 28: Placement Matrix with Organic Fragile Safeguards
+        if is_auto and (c["tos"] >= 100 or c["pp"] >= 30 or c["ros"] >= 30):
+            if is_fragile:
+                target_tos = max(40, int(c["tos"] * 0.70))
+                all_final_adjustments.append({
+                    "action_type": "Placement_TOS_PP_ROS",
+                    "campaign": c["name"],
+                    "target_entity": "CampaignPlacement",
+                    "match_type": "placement",
+                    "current_value": f"TOS={int(c['tos'])}% / PP={int(c['pp'])}% / ROS={int(c['ros'])}%",
+                    "recommended_value": f"TOS={target_tos}% / PP=0% / ROS=15%",
+                    "reason": f"脆弱型Listing阶梯微降：自动仓TOS单步适度下调至{target_tos}%（降幅<=30%），约束PP与ROS溢价，防范断流失速与展位漂移",
+                })
+            else:
+                all_final_adjustments.append({
+                    "action_type": "Placement_TOS_PP_ROS",
+                    "campaign": c["name"],
+                    "target_entity": "CampaignPlacement",
+                    "match_type": "placement",
+                    "current_value": f"TOS={int(c['tos'])}% / PP={int(c['pp'])}% / ROS={int(c['ros'])}%",
+                    "recommended_value": "TOS=20% / PP=0% / ROS=15%",
+                    "reason": "自动探索仓低TOS平衡网罗搜索词，同时约束PP与ROS溢价，防范展位漂移至低效竞品页引发失血暴冲",
+                })
+        elif is_exact and (c["tos"] < 40 or c["pp"] > 15 or c["ros"] > 30):
+            all_final_adjustments.append({
+                "action_type": "Placement_TOS_PP_ROS",
+                "campaign": c["name"],
+                "target_entity": "CampaignPlacement",
+                "match_type": "placement",
+                "current_value": f"TOS={int(c['tos'])}% / PP={int(c['pp'])}% / ROS={int(c['ros'])}%",
+                "recommended_value": "TOS=50% / PP=0% / ROS=10%",
+                "reason": "精准收割仓重兵抢占首屏顶部促转化，削减商品页与其余位低效溢价",
+            })
+        elif is_comp and (c["tos"] > 20 or c["pp"] < 20 or c["ros"] > 20):
+            all_final_adjustments.append({
+                "action_type": "Placement_TOS_PP_ROS",
+                "campaign": c["name"],
+                "target_entity": "CampaignPlacement",
+                "match_type": "placement",
+                "current_value": f"TOS={int(c['tos'])}% / PP={int(c['pp'])}% / ROS={int(c['ros'])}%",
+                "recommended_value": "TOS=0% / PP=20% / ROS=0%",
+                "reason": "竞品防御仓削减TOS与ROS，主打商品页详情拦截，基础竞价下调防守",
+            })
+        elif is_broad and (c["tos"] >= 120 or c["pp"] >= 40 or c["ros"] >= 40):
+            if is_fragile:
+                target_tos = max(50, int(c["tos"] * 0.70))
+                all_final_adjustments.append({
+                    "action_type": "Placement_TOS_PP_ROS",
+                    "campaign": c["name"],
+                    "target_entity": "CampaignPlacement",
+                    "match_type": "placement",
+                    "current_value": f"TOS={int(c['tos'])}% / PP={int(c['pp'])}% / ROS={int(c['ros'])}%",
+                    "recommended_value": f"TOS={target_tos}% / PP=0% / ROS=15%",
+                    "reason": f"脆弱型Listing阶梯微降：广泛仓TOS单步适度下调至{target_tos}%（降幅<=30%），平稳释放长尾词流，防范大盘失速",
+                })
+            else:
+                all_final_adjustments.append({
+                    "action_type": "Placement_TOS_PP_ROS",
+                    "campaign": c["name"],
+                    "target_entity": "CampaignPlacement",
+                    "match_type": "placement",
+                    "current_value": f"TOS={int(c['tos'])}% / PP={int(c['pp'])}% / ROS={int(c['ros'])}%",
+                    "recommended_value": "TOS=30% / PP=0% / ROS=15%",
+                    "reason": "广泛拓展仓拉平畸形溢价，中低TOS网罗长尾词流，防范单次点击成本虚高",
+                })
+        elif c["tos"] >= 150:
             all_final_adjustments.append({
                 "action_type": "Placement_TOS",
                 "campaign": c["name"],
@@ -2710,6 +3295,52 @@ def main() -> None:
                 "reason": "Low CVR (<=11%) or high ACOS (>=24%) window; high click waste without purchase intent",
             })
 
+    # 11.6 Dual-track rank synergy adjustments (西柚洞察自然/广告位双轨协同控价 - 铁律 38)
+    if xydc_map and kws:
+        camp_lookup_all = {c["name"]: c for c in camps if c.get("name")}
+        for k in kws:
+            kw_state = str(k.get("state") or "enabled").lower().strip()
+            if kw_state != "enabled":
+                continue
+            c_name = k.get("campaign_name") or ""
+            camp_obj = camp_lookup_all.get(c_name, {})
+            if camp_obj.get("state") != "enabled":
+                continue
+            if c_name in locked_campaigns:
+                continue
+            kw_text = (k.get("keyword_text") or k.get("targeting_text") or "").strip()
+            if not kw_text:
+                continue
+            k_spend = num(k.get("spends"))
+            k_sales = num(k.get("sales"))
+            k_orders = int(num(k.get("orders")))
+            k_clicks = int(num(k.get("clicks")))
+            k_bid = num(k.get("bid"))
+            if k_bid <= 0:
+                k_bid = camp_base_bid_map.get(c_name, 0.35)
+
+            synergy = evaluate_rank_synergy(
+                term=kw_text,
+                xydc_map=xydc_map,
+                spend=k_spend,
+                sales=k_sales,
+                orders=k_orders,
+                clicks=k_clicks,
+                target_acos=target_acos or 25.0,
+                current_bid=k_bid,
+            )
+            act_type = synergy.get("action_type")
+            if act_type in ("Throttle_Cannibalization_Bid", "Boost_Ascender_TOS"):
+                all_final_adjustments.append({
+                    "action_type": act_type,
+                    "campaign": c_name,
+                    "target_entity": kw_text,
+                    "match_type": k.get("match_type") or "exact",
+                    "current_value": f"当前基础竞价 ${k_bid:.2f} (自然位#{synergy['organic_rank']}, 广告位#{synergy['sp_rank'] or '--'})",
+                    "recommended_value": synergy["recommended_value"],
+                    "reason": f"西柚洞察双轨协同：{synergy['reason']}",
+                })
+
     # Deduplicate actions by (action_type, campaign, target_entity)
     deduped_adjustments = []
     seen_adj_keys = set()
@@ -2721,12 +3352,52 @@ def main() -> None:
         deduped_adjustments.append(item)
 
     bulk_lines = []
-    for item in deduped_adjustments:
+    for raw_item in deduped_adjustments:
+        item = dict(raw_item)
+        act = item.get("action_type", "")
+        rec = str(item.get("recommended_value", "")).strip()
+        cur = str(item.get("current_value", "")).strip()
+        rsn = str(item.get("reason", "")).strip()
+
+        # 铁律 30 纯净数值与领星可直接导入标准落地 (TSV Zero-Placeholder & Pure Value Sanitizer)
+        # 1. 竞价调价类 (Throttle_TOS_Bid, Elevate_To_TOS, Lower_Bid, Probe_Bid_Recovery, Update_Bid, Boost_Ascender_TOS):
+        if any(x in act for x in ("Bid", "Throttle", "Elevate", "Boost")) and "Schedule" not in rec and "Schedule" not in act and "Placement" not in act:
+            m_bid = re.search(r"\$([0-9]+(?:\.[0-9]+)?)", rec)
+            if m_bid:
+                pure_val = f"${float(m_bid.group(1)):.2f}"
+                if rec != pure_val:
+                    rsn = f"[{rec}] " + rsn
+                    item["recommended_value"] = pure_val
+
+        # 2. 状态调整类 (Unpause_Keyword, Pause_Keyword):
+        if act == "Unpause_Keyword":
+            m_bid = re.search(r"\$([0-9]+(?:\.[0-9]+)?)", rec)
+            if m_bid:
+                item["recommended_value"] = f"state=enabled (bid=${float(m_bid.group(1)):.2f})"
+            else:
+                item["recommended_value"] = "state=enabled"
+        elif act == "Pause_Keyword":
+            item["recommended_value"] = "state=paused"
+
+        # 3. 移词收割精准词 (Harvest_To_Exact):
+        if act == "Harvest_To_Exact":
+            m_bid = re.search(r"\$([0-9]+(?:\.[0-9]+)?)", rec)
+            if m_bid:
+                item["recommended_value"] = f"${float(m_bid.group(1)):.2f}"
+                rsn = f"[Add Exact Target ${float(m_bid.group(1)):.2f}] " + rsn
+
+        # 4. 彻底杜绝文本占位符泄露 (Current Lowered Bid 等)
+        if "Current Lowered Bid" in cur:
+            item["current_value"] = "$0.30"
+        if act == "Probe_Bid_Recovery" and not re.search(r"\$[0-9]", item["recommended_value"]):
+            item["recommended_value"] = "$0.45"
+            rsn = f"[{rec}] " + rsn
+
+        item["reason"] = rsn
         bulk_lines.append("\t".join([
             item["action_type"], item["campaign"], item["target_entity"],
             item["match_type"], item["current_value"], item["recommended_value"], item["reason"]
         ]))
-    gen_time_str = args.timestamp or datetime.now().strftime("%Y%m%d-%H%M%S")
     tsv(
         dest / "bulk_adjustments.tsv",
         "action_type\tcampaign\ttarget_entity\tmatch_type\tcurrent_value\trecommended_value\treason",
@@ -2768,6 +3439,10 @@ def main() -> None:
                 json.dumps(traffic_prof, ensure_ascii=False, indent=2), encoding="utf-8"
             )
 
+    return deduped_adjustments
+
+def write_observation_status(active_cooldowns, camps, dest):
+    """observation_status.tsv -- what is still inside its cooling-off window."""
     # 12. Output observation_status.tsv
     obs_lines = []
     for cd in active_cooldowns:
@@ -2789,7 +3464,7 @@ def main() -> None:
             str(cd.get("field", "")),
             str(cd.get("old_value", "")),
             str(cd.get("new_value", "")),
-            str(cd.get("changed_at", "")[:10]),
+            str((cd.get("changed_at") or "")[:10]),
             str(cd.get("days_elapsed", 0)),
             str(cd.get("days_remaining", 0)),
             obs_status,
@@ -2801,13 +3476,18 @@ def main() -> None:
         obs_lines,
     )
 
-    # 13. Output persistent historical_ledger files into DB, dest, and exports
+
+def write_ledger_files(args, dest, gen_time_str, ledger, ledger_dir, meta, profile, snap_key):
+    """Persist the historical ledger into the db, the analysis dir, and the export dir."""
     asin_str = str(meta.get("asin") or profile.get("asin") or "UNKNOWN").upper()
     country_str = str(meta.get("country") or "US").upper()
     file_prefix = f"{asin_str}-{country_str}"
     exp_dir_p = Path(args.export_dir) if args.export_dir else None
     save_ledger_files(ledger, ledger_dir, snap_key, dest, exp_dir_p, file_prefix, gen_time_str)
 
+
+def write_summary(active_cooldowns, active_neg_dict, asin_campaigns, audit_records, bleeding_ng, camps, cannibal_lines, dayparting_records, deduped_adjustments, dest, diff_events, financial_prof, gen_date_str, gen_time_str, kw_misfit_adjustments, ledger, locked_campaigns, meta, placement_diagnoses, profile, snap_key, sr_map, traffic_prof, xydc_map=None):
+    """summary.txt -- the headline numbers the report template reads."""
     # 14. Output summary.txt
     enabled = [c for c in camps if c["state"] == "enabled"]
     total_spend = sum(c["spend"] for c in camps)
@@ -2900,6 +3580,7 @@ def main() -> None:
     protected_strong_count = sum(1 for a in deduped_adjustments if a.get("action_type") in ("Refine_Bid_Placement", "Elevate_To_TOS", "Throttle_TOS_Bid"))
     summary.append(f"strong_relevance_queries_protected\t{protected_strong_count}")
     competitor_actions_count = sum(1 for a in deduped_adjustments if a.get("match_type") == "asinSameAs")
+    summary.append(f"competitor_asin_actions\t{competitor_actions_count}")
     if financial_prof:
         summary.append(f"financial_gross_profit\t${financial_prof.get('gross_profit', 0):.2f}\tmargin={financial_prof.get('gross_margin', 0):.1f}%\tbreak_even_acos={financial_prof.get('break_even_acos', 0):.1f}%")
         summary.append(f"financial_cost_structure\tcogs=${financial_prof.get('cogs_per_unit', 0):.2f}\tfreight=${financial_prof.get('logistics_per_unit', 0):.2f}\tfba=${financial_prof.get('fba_per_unit', 0):.2f}\tcomm=${financial_prof.get('comm_per_unit', 0):.2f}")
@@ -2916,8 +3597,193 @@ def main() -> None:
         summary.append(f"dayparting_bleeding_hours\t{', '.join(bleed_hrs) if bleed_hrs else 'None'}")
     if diff_events:
         summary.append(f"diff_events_detected\t{' ; '.join(diff_events[:5])}")
+    if xydc_map:
+        t1_cnt = sum(1 for v in xydc_map.values() if v.get("organic_rank") and v.get("organic_rank") <= 3)
+        t2_cnt = sum(1 for v in xydc_map.values() if v.get("organic_rank") and 4 <= v.get("organic_rank") <= 15)
+        t3_cnt = sum(1 for v in xydc_map.values() if v.get("organic_rank") and 16 <= v.get("organic_rank") <= 50)
+        t4_cnt = sum(1 for v in xydc_map.values() if (v.get("organic_rank") is None or v.get("organic_rank") > 50) and (v.get("sp_rank") and v.get("sp_rank") <= 10))
+        summary.append(f"xydc_ranks_total_tracked\t{len(xydc_map)}")
+        summary.append(f"xydc_tier1_dominance_count\t{t1_cnt}")
+        summary.append(f"xydc_tier2_ascender_count\t{t2_cnt}")
+        summary.append(f"xydc_tier3_breakthrough_count\t{t3_cnt}")
+        summary.append(f"xydc_tier4_disconnect_count\t{t4_cnt}")
     summary.append(f"generation_timestamp\t{gen_time_str}")
     dest.joinpath("summary.txt").write_text("\n".join(summary), encoding="utf-8")
+
+    return summary
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--indir", required=True)
+    parser.add_argument("--outdir", required=True)
+    parser.add_argument("--rules", default=None, help="Optional path to product_rules.json")
+    parser.add_argument("--snapshots-dir", default=None, help="Optional path to snapshots directory")
+    parser.add_argument("--db-dir", default=None, help="Optional path to database directory (default: workspace db/)")
+    parser.add_argument("--cooldown-days", type=int, default=7, help="Cooldown observation period in days (default: 7)")
+    parser.add_argument("--target-acos", type=float, default=None, help="Target ACOS percent threshold (e.g. 25.0)")
+    parser.add_argument("--timestamp", default=None, help="Optional timestamp string (e.g. 20260926-104901). Defaults to current local time.")
+    parser.add_argument("--known-negatives", default=None, help="Comma-separated or file path of already negated keywords/phrases")
+    parser.add_argument("--export-dir", default=None, help="Optional export directory (e.g. outputs) to export timestamped bulk adjustments table.")
+    args = parser.parse_args()
+
+    src = Path(args.indir)
+    dest = Path(args.outdir)
+    dest.mkdir(parents=True, exist_ok=True)
+
+    known_negatives = load_known_negatives(args=args, src=src)
+    dayparting_records, dayparting_table_lines, financial_prof, gen_time_str, meta, profile, rules, target_acos, traffic_prof = load_product_context(
+        args=args,
+        dest=dest,
+        src=src,
+    )
+    asin_campaigns, camps, kws, kws_3d, kws_7d, targets = load_report_frames(
+        meta=meta,
+        profile=profile,
+        src=src,
+    )
+    active_cooldowns, daily_records_dir, diff_events, gen_date_str, ledger, ledger_dir, locked_campaigns, snap_key = run_state_tracking(
+        args=args,
+        camps=camps,
+        dayparting_records=dayparting_records,
+        financial_prof=financial_prof,
+        kws=kws,
+        meta=meta,
+        profile=profile,
+        src=src,
+        targets=targets,
+        traffic_prof=traffic_prof,
+    )
+    write_campaigns_tsv(camps=camps, dest=dest)
+    assess_and_write_placements(
+        active_cooldowns=active_cooldowns,
+        args=args,
+        camps=camps,
+        dest=dest,
+        locked_campaigns=locked_campaigns,
+        target_acos=target_acos,
+        traffic_prof=traffic_prof,
+    )
+    # Archive Daily Record into Database AFTER c['assessment'] is set!
+    now_iso = datetime.now().isoformat()
+    archive_daily_record(
+        daily_records_dir, snap_key, gen_date_str, now_iso,
+        meta, profile, financial_prof, traffic_prof, camps, dayparting_records
+    )
+    sr_map = load_searchrank_map(src=src)
+    xydc_map = load_xydc_ranks(src=src)
+    write_keywords_tsv(dest=dest, kws=kws, sr_map=sr_map, xydc_map=xydc_map)
+    active_neg_dict, all_neg_queries, audit_records, bucket_stats, bulk_adjustments, camp_lookup, cannibal_map, harvest, kw_misfit_adjustments, ngram_stats, placement_diagnoses, st_lines, unnegative_adjustments, waste = analyze_search_terms(
+        asin_campaigns=asin_campaigns,
+        camps=camps,
+        known_negatives=known_negatives,
+        kws=kws,
+        kws_3d=kws_3d,
+        kws_7d=kws_7d,
+        profile=profile,
+        rules=rules,
+        sr_map=sr_map,
+        src=src,
+        target_acos=target_acos,
+        xydc_map=xydc_map,
+    )
+    write_search_term_outputs(
+        args=args,
+        dest=dest,
+        gen_time_str=gen_time_str,
+        harvest=harvest,
+        meta=meta,
+        placement_diagnoses=placement_diagnoses,
+        profile=profile,
+        st_lines=st_lines,
+        waste=waste,
+    )
+    write_rank_synergy_tsv(
+        args=args,
+        dest=dest,
+        gen_time_str=gen_time_str,
+        kws=kws,
+        meta=meta,
+        profile=profile,
+        target_acos=target_acos,
+        xydc_map=xydc_map,
+    )
+    write_buckets_tsv(bucket_stats=bucket_stats, dest=dest)
+    bleeding_ng = write_ngram_outputs(
+        all_neg_queries=all_neg_queries,
+        bulk_adjustments=bulk_adjustments,
+        dest=dest,
+        known_negatives=known_negatives,
+        ngram_stats=ngram_stats,
+        profile=profile,
+        rules=rules,
+    )
+    cannibal_lines = write_cannibalization_tsv(cannibal_map=cannibal_map, dest=dest)
+    write_groups_tsv(asin_campaigns=asin_campaigns, dest=dest, src=src)
+    write_targets_tsv(
+        bulk_adjustments=bulk_adjustments,
+        camp_lookup=camp_lookup,
+        dest=dest,
+        profile=profile,
+        target_acos=target_acos,
+        targets=targets,
+    )
+    write_negative_tsvs(active_neg_dict=active_neg_dict, audit_records=audit_records, dest=dest)
+    deduped_adjustments = assemble_and_write_adjustments(
+        args=args,
+        bulk_adjustments=bulk_adjustments,
+        camps=camps,
+        dayparting_records=dayparting_records,
+        dayparting_table_lines=dayparting_table_lines,
+        dest=dest,
+        financial_prof=financial_prof,
+        gen_time_str=gen_time_str,
+        kw_misfit_adjustments=kw_misfit_adjustments,
+        locked_campaigns=locked_campaigns,
+        meta=meta,
+        profile=profile,
+        target_acos=target_acos,
+        traffic_prof=traffic_prof,
+        unnegative_adjustments=unnegative_adjustments,
+        kws=kws,
+        xydc_map=xydc_map,
+    )
+    write_observation_status(active_cooldowns=active_cooldowns, camps=camps, dest=dest)
+    write_ledger_files(
+        args=args,
+        dest=dest,
+        gen_time_str=gen_time_str,
+        ledger=ledger,
+        ledger_dir=ledger_dir,
+        meta=meta,
+        profile=profile,
+        snap_key=snap_key,
+    )
+    summary = write_summary(
+        active_cooldowns=active_cooldowns,
+        active_neg_dict=active_neg_dict,
+        asin_campaigns=asin_campaigns,
+        audit_records=audit_records,
+        bleeding_ng=bleeding_ng,
+        camps=camps,
+        cannibal_lines=cannibal_lines,
+        dayparting_records=dayparting_records,
+        deduped_adjustments=deduped_adjustments,
+        dest=dest,
+        diff_events=diff_events,
+        financial_prof=financial_prof,
+        gen_date_str=gen_date_str,
+        gen_time_str=gen_time_str,
+        kw_misfit_adjustments=kw_misfit_adjustments,
+        ledger=ledger,
+        locked_campaigns=locked_campaigns,
+        meta=meta,
+        placement_diagnoses=placement_diagnoses,
+        profile=profile,
+        snap_key=snap_key,
+        sr_map=sr_map,
+        traffic_prof=traffic_prof,
+        xydc_map=xydc_map,
+    )
 
     print(f"Analysis complete. Tables saved to {dest}")
     print("\n".join(summary[:16]))

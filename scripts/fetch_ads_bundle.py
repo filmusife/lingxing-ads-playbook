@@ -6,8 +6,11 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import date, timedelta, datetime
 from pathlib import Path
+from typing import Callable
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import lx_client as lx
@@ -29,6 +32,8 @@ COUNTRY_ALIASES = {
     "波兰": "PL", "pl": "PL",
     "土耳其": "TR", "tr": "TR",
 }
+
+DEFAULT_CONCURRENCY = 6
 
 
 def save(path: Path, obj) -> None:
@@ -56,18 +61,60 @@ def get_multi_windows(macro_days: int = 30) -> dict[str, str]:
     }
 
 
+def split_window(window: str) -> tuple[str, str] | None:
+    parts = [p.strip() for p in (window or "").split(" - ")]
+    if len(parts) < 2 or not parts[0] or not parts[1]:
+        return None
+    return parts[0], parts[1]
+
+
+# ==============================================================================
+# PARALLEL FETCH ENGINE
+# ==============================================================================
+
+@dataclass
+class FetchSpec:
+    """One independent endpoint pull: what to call, where to save it, is it fatal if it fails."""
+    key: str
+    filename: str
+    fetch: Callable[[], list[dict]]
+    required: bool = False
+
+
+def run_specs(specs: list[FetchSpec], outdir: Path, max_workers: int = DEFAULT_CONCURRENCY) -> dict[str, int]:
+    """Run independent endpoint pulls concurrently, then save each result in the main thread.
+
+    Every spec hits a different endpoint, so they only contend on the network. Pagination
+    inside a single spec stays sequential because page N+1 depends on page N.
+    """
+    counts: dict[str, int] = {}
+    if not specs:
+        return counts
+
+    workers = max(1, min(max_workers, len(specs)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [(spec, pool.submit(spec.fetch)) for spec in specs]
+        for spec, fut in futures:
+            try:
+                rows = fut.result()
+            except Exception as exc:
+                if spec.required:
+                    raise
+                print(f"Warning: could not fetch {spec.key}: {exc}", file=sys.stderr)
+                continue
+            save(outdir / spec.filename, rows)
+            counts[spec.key] = len(rows)
+    return counts
+
+
 def shops_for_country(country: str) -> list[dict]:
     payload = lx.action("ad_auth_shops", {})
-    out = []
-    for row in lx.rows(payload):
-        if str(row.get("country") or "").upper() != country:
-            continue
-        if row.get("real_status") not in (1, "1", None, True):
-            # keep unknown status; skip explicit dead
-            if row.get("real_status") in (0, "0", False):
-                continue
-        out.append(row)
-    return out
+    # Keep rows whose status is unknown; drop only the explicitly dead ones.
+    return [
+        row for row in lx.rows(payload)
+        if str(row.get("country") or "").upper() == country
+        and row.get("real_status") not in (0, "0", False)
+    ]
 
 
 def listing_lookup(sid, asin: str) -> list[dict]:
@@ -137,126 +184,59 @@ def base_report_params(profile_id: str, window: str, extra: dict | None = None) 
     return params
 
 
-def fetch_reports(
+def probe_campaign_count(profile_id: str, window: str, extra: dict | None = None) -> int:
+    """One cheap single-page call to decide whether the SKU filter is too narrow.
+
+    Cheaper than fetching every report twice just to discover the filter was wrong.
+    """
+    params = base_report_params(profile_id, window, extra)
+    params["length"] = 20
+    rows = lx.rows(lx.action("ad_campaign_report", params))
+    return len([r for r in rows if r.get("name") or r.get("campaign_id")])
+
+
+def build_report_specs(
     profile_id: str,
-    window: str,
-    outdir: Path,
+    windows: dict[str, str],
     sku: str | None = None,
     asin: str | None = None,
     portfolio_id: str | None = None,
-    windows_dict: dict[str, str] | None = None,
-) -> dict:
+) -> list[FetchSpec]:
+    """Describe every ads report pull as data so they can run in parallel."""
     pid = str(profile_id)
-    bundle = {}
-    extra = {"sku": [sku]} if sku else {}
+    w30 = windows["macro_30d"]
+    w7 = windows["recent_7d"]
+    w3 = windows["recent_3d"]
+
+    sku_extra = {"sku": [sku]} if sku else {}
+    pid_int = int(pid) if pid.isdigit() else pid
+
+    def paginated(tool_id: str, params: dict, max_pages: int = 20) -> Callable[[], list[dict]]:
+        return lambda: lx.paginate(tool_id, params, max_pages=max_pages)
+
+    camp_extra = dict(sku_extra)
     if portfolio_id:
-        extra["portfolio_id"] = str(portfolio_id)
+        camp_extra["portfolio_id"] = str(portfolio_id)
 
-    # 1. Campaigns (30-day Macro Baseline)
-    camp_params = base_report_params(pid, window, extra)
-    campaigns = lx.paginate("ad_campaign_report", camp_params)
-    save(outdir / "campaign_report.json", campaigns)
-    bundle["campaigns"] = len(campaigns)
-
-    # Multi-window fresh slices for dynamic delta and trend detection
-    w_7d = (windows_dict.get("recent_7d") if windows_dict else None) or report_window(7)
-    w_3d = (windows_dict.get("recent_3d") if windows_dict else None) or report_window(3)
-
-    try:
-        camp_params_7d = base_report_params(pid, w_7d, extra)
-        campaigns_7d = lx.paginate("ad_campaign_report", camp_params_7d)
-        save(outdir / "campaign_report_7d.json", campaigns_7d)
-        bundle["campaigns_7d"] = len(campaigns_7d)
-    except Exception as exc:
-        print(f"Warning: could not fetch campaign_report_7d: {exc}", file=sys.stderr)
-
-    try:
-        camp_params_3d = base_report_params(pid, w_3d, extra)
-        campaigns_3d = lx.paginate("ad_campaign_report", camp_params_3d)
-        save(outdir / "campaign_report_3d.json", campaigns_3d)
-        bundle["campaigns_3d"] = len(campaigns_3d)
-    except Exception as exc:
-        print(f"Warning: could not fetch campaign_report_3d: {exc}", file=sys.stderr)
-
-    # 2. Ad Groups
-    grp_extra = {"with_ring": 0, **({"sku": [sku]} if sku else {})}
+    grp_extra = {"with_ring": 0, **sku_extra}
     if portfolio_id:
         grp_extra["portfolio_id"] = [str(portfolio_id)]
-    groups = lx.paginate(
-        "ad_campaign_group_report",
-        base_report_params(pid, window, grp_extra),
-    )
-    save(outdir / "ad_groups.json", groups)
-    bundle["groups"] = len(groups)
 
-    # 3. Keywords (30d macro, 7d trend, 3d micro)
-    kw_extra = dict(extra)
+    kw_extra = dict(sku_extra)
     if portfolio_id:
         kw_extra["portfolio_id"] = [str(portfolio_id)]
-    keywords = lx.paginate("ad_campaign_keyword_report", base_report_params(pid, window, kw_extra))
-    save(outdir / "keywords.json", keywords)
-    bundle["keywords"] = len(keywords)
 
-    try:
-        kw_params_7d = base_report_params(pid, w_7d, kw_extra)
-        keywords_7d = lx.paginate("ad_campaign_keyword_report", kw_params_7d)
-        save(outdir / "keywords_7d.json", keywords_7d)
-        bundle["keywords_7d"] = len(keywords_7d)
-    except Exception as exc:
-        print(f"Warning: could not fetch keywords_7d: {exc}", file=sys.stderr)
-
-    try:
-        kw_params_3d = base_report_params(pid, w_3d, kw_extra)
-        keywords_3d = lx.paginate("ad_campaign_keyword_report", kw_params_3d)
-        save(outdir / "keywords_3d.json", keywords_3d)
-        bundle["keywords_3d"] = len(keywords_3d)
-    except Exception as exc:
-        print(f"Warning: could not fetch keywords_3d: {exc}", file=sys.stderr)
-
-    # 4. Search Terms (with automatic translation)
     st_extra = {"length": 100, "with_translation": 1, **({"sku": sku} if sku else {})}
     if portfolio_id:
         st_extra["portfolio_id"] = [str(portfolio_id)]
-    search_terms = lx.paginate(
-        "ad_campaign_search_term_report",
-        base_report_params(pid, window, st_extra),
-        max_pages=40,
-    )
-    save(outdir / "search_terms.json", search_terms)
-    bundle["search_terms"] = len(search_terms)
 
-    # 5. Product Targets (30d macro, 7d trend, 3d micro)
     tg_extra = {"with_ring": 0, "length": "100"}
     if portfolio_id:
         tg_extra["portfolio_id"] = [str(portfolio_id)]
-    targets = lx.paginate(
-        "ad_campaign_targeting_report",
-        base_report_params(pid, window, tg_extra),
-        max_pages=20,
-    )
-    save(outdir / "targets.json", targets)
-    bundle["targets"] = len(targets)
 
-    try:
-        tg_params_7d = base_report_params(pid, w_7d, tg_extra)
-        targets_7d = lx.paginate("ad_campaign_targeting_report", tg_params_7d, max_pages=20)
-        save(outdir / "targets_7d.json", targets_7d)
-        bundle["targets_7d"] = len(targets_7d)
-    except Exception as exc:
-        print(f"Warning: could not fetch targets_7d: {exc}", file=sys.stderr)
-
-    try:
-        tg_params_3d = base_report_params(pid, w_3d, tg_extra)
-        targets_3d = lx.paginate("ad_campaign_targeting_report", tg_params_3d, max_pages=20)
-        save(outdir / "targets_3d.json", targets_3d)
-        bundle["targets_3d"] = len(targets_3d)
-    except Exception as exc:
-        print(f"Warning: could not fetch targets_3d: {exc}", file=sys.stderr)
-
-    # 6. Product Ads
     prod_params = {
-        "report_date": window,
-        "profile_id": int(pid) if str(pid).isdigit() else pid,
+        "report_date": w30,
+        "profile_id": pid_int,
         "page": 1,
         "length": 100,
         "sort_field": "spends",
@@ -265,86 +245,73 @@ def fetch_reports(
     }
     if portfolio_id:
         prod_params["portfolio_id"] = [str(portfolio_id)]
-    products = lx.paginate(
-        "ad_campaign_product_report",
-        prod_params,
-        max_pages=15,
-    )
-    save(outdir / "product_ads.json", products)
-    bundle["product_ads"] = len(products)
 
-    # 7. Portfolios
-    portfolios = lx.paginate(
-        "ad_portfolio_report_shop",
-        base_report_params(pid, window),
-    )
-    save(outdir / "portfolios.json", portfolios)
-    bundle["portfolios"] = len(portfolios)
+    specs = [
+        # (key, filename, tool, params, max_pages, required)
+        ("campaigns", "campaign_report.json", "ad_campaign_report", base_report_params(pid, w30, camp_extra), 20, True),
+        ("campaigns_7d", "campaign_report_7d.json", "ad_campaign_report", base_report_params(pid, w7, camp_extra), 20, False),
+        ("campaigns_3d", "campaign_report_3d.json", "ad_campaign_report", base_report_params(pid, w3, camp_extra), 20, False),
+        ("groups", "ad_groups.json", "ad_campaign_group_report", base_report_params(pid, w30, grp_extra), 20, True),
+        ("keywords", "keywords.json", "ad_campaign_keyword_report", base_report_params(pid, w30, kw_extra), 20, True),
+        ("keywords_7d", "keywords_7d.json", "ad_campaign_keyword_report", base_report_params(pid, w7, kw_extra), 20, False),
+        ("keywords_3d", "keywords_3d.json", "ad_campaign_keyword_report", base_report_params(pid, w3, kw_extra), 20, False),
+        ("search_terms", "search_terms.json", "ad_campaign_search_term_report", base_report_params(pid, w30, st_extra), 40, True),
+        ("targets", "targets.json", "ad_campaign_targeting_report", base_report_params(pid, w30, tg_extra), 20, True),
+        ("targets_7d", "targets_7d.json", "ad_campaign_targeting_report", base_report_params(pid, w7, tg_extra), 20, False),
+        ("targets_3d", "targets_3d.json", "ad_campaign_targeting_report", base_report_params(pid, w3, tg_extra), 20, False),
+        ("product_ads", "product_ads.json", "ad_campaign_product_report", prod_params, 15, True),
+        ("portfolios", "portfolios.json", "ad_portfolio_report_shop", base_report_params(pid, w30), 20, True),
+    ]
+    out = [
+        FetchSpec(key=key, filename=fname, fetch=paginated(tool, params, pages), required=req)
+        for key, fname, tool, params, pages, req in specs
+    ]
 
-    # 8. Keyword Analysis (ABA search rank / search volume)
-    try:
-        parts = [p.strip() for p in window.split(" - ")]
-        if len(parts) >= 2:
-            kw_analysis = lx.paginate(
-                "advertising_ad_analyze_keyword",
-                {
-                    "start_date": parts[0],
-                    "end_date": parts[1],
-                    "asin": [asin] if asin else None,
-                    "profile_id": int(pid) if str(pid).isdigit() else pid,
-                    "limit": 100,
-                },
-                max_pages=20,
-            )
-            save(outdir / "keyword_analysis.json", kw_analysis)
-            bundle["keyword_analysis"] = len(kw_analysis)
-    except Exception as exc:
-        print(f"Warning: could not fetch keyword_analysis: {exc}", file=sys.stderr)
-
-    return bundle
+    # Keyword Analysis (ABA search rank / search volume) takes explicit dates, not a window string.
+    bounds = split_window(w30)
+    if bounds:
+        out.append(FetchSpec(
+            key="keyword_analysis",
+            filename="keyword_analysis.json",
+            fetch=paginated("advertising_ad_analyze_keyword", {
+                "start_date": bounds[0],
+                "end_date": bounds[1],
+                "asin": [asin] if asin else None,
+                "profile_id": pid_int,
+                "limit": 100,
+            }, 20),
+        ))
+    return out
 
 
-def fetch_advanced_intelligence(sid: str, sku: str | None, asin: str, window: str, outdir: Path) -> dict:
-    """Fetch Dayparting (Hourly/Weekly), Product Traffic Performance (Sessions/CVR), and Real Financial Profit."""
-    adv_bundle = {}
-    parts = [p.strip() for p in window.split(" - ")]
-    if len(parts) < 2:
-        return adv_bundle
-    start_date, end_date = parts[0], parts[1]
+def build_advanced_specs(sid: str, sku: str | None, asin: str, window: str) -> list[FetchSpec]:
+    """Dayparting (hourly/weekly), product traffic performance, and real financial profit."""
+    bounds = split_window(window)
+    if not bounds:
+        return []
+    start_date, end_date = bounds
 
-    # 1. Dayparting: 24-hour and Day-of-Week Order Analysis
+    def single(tool_id: str, params: dict) -> Callable[[], list[dict]]:
+        return lambda: lx.rows(lx.action(tool_id, params))
+
+    specs: list[FetchSpec] = []
     if sku:
-        try:
-            h_res = lx.action("advertising_order_analysis_list", {
+        for key, fname, group in (
+            ("hourly_dayparting", "order_analysis_hourly.json", "hourly"),
+            ("weekly_dayparting", "order_analysis_weekly.json", "weekly"),
+        ):
+            specs.append(FetchSpec(key=key, filename=fname, fetch=single("advertising_order_analysis_list", {
                 "sid": str(sid),
                 "sku": [sku],
                 "start_date": start_date,
                 "end_date": end_date,
-                "group_type": "hourly",
-            })
-            hourly_rows = lx.rows(h_res)
-            save(outdir / "order_analysis_hourly.json", hourly_rows)
-            adv_bundle["hourly_dayparting"] = len(hourly_rows)
-        except Exception as exc:
-            print(f"Warning: hourly order analysis failed: {exc}", file=sys.stderr)
+                "group_type": group,
+            })))
 
-        try:
-            w_res = lx.action("advertising_order_analysis_list", {
-                "sid": str(sid),
-                "sku": [sku],
-                "start_date": start_date,
-                "end_date": end_date,
-                "group_type": "weekly",
-            })
-            weekly_rows = lx.rows(w_res)
-            save(outdir / "order_analysis_weekly.json", weekly_rows)
-            adv_bundle["weekly_dayparting"] = len(weekly_rows)
-        except Exception as exc:
-            print(f"Warning: weekly order analysis failed: {exc}", file=sys.stderr)
-
-    # 2. Product Traffic Performance (Sessions, Pageviews, Organic vs Ad CVR, TACOS)
-    try:
-        p_res = lx.action("query_product_performance_asin_lists", {
+    specs.append(FetchSpec(
+        key="product_performance",
+        filename="product_performance.json",
+        fetch=single("query_product_performance_asin_lists", {
             "sids": str(sid),
             "search_field": "asin",
             "search_value": [asin],
@@ -352,16 +319,12 @@ def fetch_advanced_intelligence(sid: str, sku: str | None, asin: str, window: st
             "end_date": end_date,
             "offset": 0,
             "length": 10,
-        })
-        perf_rows = lx.rows(p_res)
-        save(outdir / "product_performance.json", perf_rows)
-        adv_bundle["product_performance"] = len(perf_rows)
-    except Exception as exc:
-        print(f"Warning: product performance query failed: {exc}", file=sys.stderr)
-
-    # 3. Real Profit Report (COGS, Logistics, Gross Profit, Selling & FBA Fees, Break-Even ACOS)
-    try:
-        profit_res = lx.action("query_order_profit_list", {
+        }),
+    ))
+    specs.append(FetchSpec(
+        key="order_profit",
+        filename="order_profit.json",
+        fetch=single("query_order_profit_list", {
             "start_date": start_date,
             "end_date": end_date,
             "currency_type": "USD",
@@ -374,14 +337,38 @@ def fetch_advanced_intelligence(sid: str, sku: str | None, asin: str, window: st
             "external_service_mark": 1,
             "search_field": "asin",
             "search_value": [asin],
-        })
-        profit_rows = lx.rows(profit_res)
-        save(outdir / "order_profit.json", profit_rows)
-        adv_bundle["order_profit"] = len(profit_rows)
-    except Exception as exc:
-        print(f"Warning: order profit query failed: {exc}", file=sys.stderr)
+        }),
+    ))
+    return specs
 
-    return adv_bundle
+
+def resolve_portfolio_id(portfolio: str, profile_id: str, window: str) -> str | None:
+    """Resolve a portfolio name to its id, falling back to the campaign report."""
+    pf_text = portfolio.strip()
+    if pf_text.isdigit():
+        return pf_text
+    needle = pf_text.lower()
+
+    try:
+        pfs = lx.paginate("ad_portfolio_report_shop", base_report_params(profile_id, window))
+    except Exception:
+        pfs = []
+    names = [(str(p.get("name") or p.get("portfolio_name") or "").strip(), p) for p in pfs]
+    for exact in (True, False):
+        for pname, p in names:
+            hit = (needle == pname.lower()) if exact else (needle in pname.lower())
+            if pname and hit:
+                return str(p.get("portfolio_id") or p.get("key"))
+
+    try:
+        campaigns = lx.paginate("ad_campaign_report", base_report_params(profile_id, window))
+    except Exception:
+        return None
+    for c in campaigns:
+        c_pname = str(c.get("portfolio_name") or "").strip().lower()
+        if c_pname and needle in c_pname and c.get("portfolio_id"):
+            return str(c["portfolio_id"])
+    return None
 
 
 def filter_asin_campaigns(product_ads: list[dict], asin: str) -> set[str]:
@@ -397,6 +384,32 @@ def filter_asin_campaigns(product_ads: list[dict], asin: str) -> set[str]:
     return names
 
 
+def log_fetch_history(db_dir: str | None, outdir: Path, meta: dict) -> None:
+    db_root = Path(db_dir) if db_dir else None
+    if db_root is None:
+        for candidate in (Path("db"), outdir.parent / "db"):
+            if candidate.exists():
+                db_root = candidate
+                break
+    if db_root is None or not db_root.exists():
+        return
+    daily_rec_dir = db_root / "daily_records"
+    try:
+        daily_rec_dir.mkdir(parents=True, exist_ok=True)
+        log_line = json.dumps({
+            "fetched_at": meta["fetched_at"],
+            "asin": meta["asin"],
+            "country": meta["country"],
+            "portfolio_id": meta["portfolio_id"],
+            "outdir": str(outdir),
+            "counts": meta["counts"],
+        }, ensure_ascii=False)
+        with open(daily_rec_dir / "fetch_history.jsonl", "a", encoding="utf-8") as f:
+            f.write(log_line + "\n")
+    except Exception:
+        pass
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--asin", required=True)
@@ -405,6 +418,8 @@ def main() -> int:
     parser.add_argument("--portfolio", default=None, help="Optional portfolio name or portfolio_id filter")
     parser.add_argument("--days", type=int, default=30)
     parser.add_argument("--db-dir", default=None, help="Optional path to database directory (default: workspace db/)")
+    parser.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY,
+                        help=f"Parallel report fetches (default: {DEFAULT_CONCURRENCY}; use 1 to serialize)")
     parser.add_argument("--outdir", required=True)
     args = parser.parse_args()
 
@@ -412,7 +427,9 @@ def main() -> int:
     country = normalize_country(args.country)
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
-    window = report_window(args.days)
+
+    multi_win = get_multi_windows(args.days)
+    window = multi_win["macro_30d"]
 
     resolved = resolve_shop(asin, country, args.shop)
     shop = resolved["shop"]
@@ -421,8 +438,11 @@ def main() -> int:
     if listing:
         save(outdir / "listing.json", listing)
 
+    profile_id = str(shop.get("profile_id"))
+    sid = str(shop.get("sid"))
+
     stock = lx.action("get_fba_stock_list", {
-        "sid": str(shop.get("sid")),
+        "sid": sid,
         "search_field": "asin",
         "search_value": asin,
         "offset": 0,
@@ -431,67 +451,49 @@ def main() -> int:
     })
     save(outdir / "fba_stock.json", stock)
 
-    msku = None
-    if listing:
-        msku = listing.get("msku") or listing.get("seller_sku")
+    msku = (listing.get("msku") or listing.get("seller_sku")) if listing else None
 
-    # Resolve portfolio_id if --portfolio passed
-    portfolio_id = None
-    if args.portfolio:
-        pf_text = args.portfolio.strip()
-        if pf_text.isdigit():
-            portfolio_id = pf_text
-        else:
-            try:
-                pfs = lx.paginate("ad_portfolio_report_shop", base_report_params(str(shop.get("profile_id")), window))
-                # Try exact match first
-                for p in pfs:
-                    pname = str(p.get("name") or p.get("portfolio_name") or "").strip()
-                    if pf_text.lower() == pname.lower():
-                        portfolio_id = str(p.get("portfolio_id") or p.get("key"))
-                        break
-                # Try substring match fallback
-                if not portfolio_id:
-                    for p in pfs:
-                        pname = str(p.get("name") or p.get("portfolio_name") or "").strip()
-                        if pf_text.lower() in pname.lower():
-                            portfolio_id = str(p.get("portfolio_id") or p.get("key"))
-                            break
-                # Fallback: find portfolio_id from ad_campaign_report
-                if not portfolio_id:
-                    try:
-                        c_res = lx.paginate("ad_campaign_report", {
-                            "profile_ids": [str(shop.get("profile_id"))],
-                            "report_date": window,
-                            "page": 1,
-                            "length": 100,
-                            "sort_field": "spends",
-                            "sort_type": "desc",
-                        })
-                        for c in c_res:
-                            c_pname = str(c.get("portfolio_name") or "").strip()
-                            if pf_text.lower() == c_pname.lower() or pf_text.lower() in c_pname.lower():
-                                if c.get("portfolio_id"):
-                                    portfolio_id = str(c["portfolio_id"])
-                                    break
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+    portfolio_id = resolve_portfolio_id(args.portfolio, profile_id, window) if args.portfolio else None
 
-    multi_win = get_multi_windows(args.days)
-    window = multi_win["macro_30d"]
+    # Decide the SKU filter with one cheap probe instead of fetching everything twice.
+    sku = msku
+    if msku:
+        probe_extra = {"sku": [msku]}
+        if portfolio_id:
+            probe_extra["portfolio_id"] = str(portfolio_id)
+        try:
+            if probe_campaign_count(profile_id, window, probe_extra) <= 1:
+                sku = None
+        except Exception as exc:
+            print(f"Warning: campaign probe failed, fetching without SKU filter: {exc}", file=sys.stderr)
+            sku = None
 
+    specs = build_report_specs(profile_id, multi_win, sku=sku, asin=asin, portfolio_id=portfolio_id)
     try:
-        counts = fetch_reports(str(shop.get("profile_id")), window, outdir, sku=msku, asin=asin, portfolio_id=portfolio_id, windows_dict=multi_win)
-        if counts.get("campaigns", 0) <= 1 and msku:
-            counts = fetch_reports(str(shop.get("profile_id")), window, outdir, sku=None, asin=asin, portfolio_id=portfolio_id, windows_dict=multi_win)
-    except Exception:
-        counts = fetch_reports(str(shop.get("profile_id")), window, outdir, portfolio_id=portfolio_id, windows_dict=multi_win)
+        counts = run_specs(specs, outdir, max_workers=args.concurrency)
+    except Exception as exc:
+        print(f"Warning: report fetch failed ({exc}); retrying unfiltered", file=sys.stderr)
+        specs = build_report_specs(profile_id, multi_win, sku=None, asin=asin, portfolio_id=portfolio_id)
+        counts = run_specs(specs, outdir, max_workers=args.concurrency)
 
     # Advanced Intelligence: Dayparting, Traffic performance, Real profit
-    adv_counts = fetch_advanced_intelligence(str(shop.get("sid")), msku, asin, window, outdir)
-    counts.update(adv_counts)
+    counts.update(run_specs(
+        build_advanced_specs(sid, msku, asin, window), outdir, max_workers=args.concurrency
+    ))
+
+    # Xiyou Dongcha (西柚洞察) Rank & Traffic Intelligence
+    try:
+        import xydc_client as xydc
+        print(f"[xydc-mcp] Probing keyword rank distribution for ASIN {asin} ({country})...")
+        xydc_ranks = xydc.fetch_asin_keyword_ranks(asin, country=country, max_keywords=1000)
+        if xydc_ranks:
+            save(outdir / "xydc_ranks.json", xydc_ranks)
+            counts["xydc_ranks"] = len(xydc_ranks)
+            print(f"[xydc-mcp] Successfully mapped {len(xydc_ranks)} keywords with organic & ad ranks.")
+        else:
+            print("[xydc-mcp] No rank records returned or xydc-mcp not responding.")
+    except Exception as exc:
+        print(f"[xydc-mcp] Optional rank intelligence skipped: {exc}", file=sys.stderr)
 
     product_ads = json.loads((outdir / "product_ads.json").read_text(encoding="utf-8"))
     asin_keys = filter_asin_campaigns(product_ads, asin)
@@ -508,30 +510,13 @@ def main() -> int:
         "days": args.days,
         "windows": multi_win,
         "listing_found": bool(listing),
+        "sku_filter": sku,
         "asin_campaign_keys": sorted(asin_keys),
         "counts": counts,
         "note": resolved.get("note"),
     }
     save(outdir / "meta.json", meta)
-
-    # Optional DB record tracking
-    db_root = Path(args.db_dir) if args.db_dir else (Path("db") if Path("db").exists() else (outdir.parent / "db" if (outdir.parent / "db").exists() else None))
-    if db_root and db_root.exists():
-        daily_rec_dir = db_root / "daily_records"
-        daily_rec_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            log_line = json.dumps({
-                "fetched_at": meta["fetched_at"],
-                "asin": asin,
-                "country": country,
-                "portfolio_id": portfolio_id,
-                "outdir": str(outdir),
-                "counts": counts,
-            }, ensure_ascii=False)
-            with open(daily_rec_dir / "fetch_history.jsonl", "a", encoding="utf-8") as f:
-                f.write(log_line + "\n")
-        except Exception:
-            pass
+    log_fetch_history(args.db_dir, outdir, meta)
 
     print(json.dumps({k: v for k, v in meta.items() if k != "asin_campaign_keys"}, ensure_ascii=False, indent=2))
     print("campaign keys", len(asin_keys))
