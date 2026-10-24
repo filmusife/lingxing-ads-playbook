@@ -23,16 +23,16 @@ metadata:
 
 1. **先产品，后 ACOS。** 从 Listing 属性判断本品 IS / IS NOT，再决定加码、保留、降价、否定。错品词即使出过单也优先否定。
 2. **看全层数据。** 至少覆盖：店铺/Profile、Listing、FBA 库存、活动（含 TOS/PP/ROS、预算、竞价策略）、广告组默认基础竞价、关键词（匹配方式 + 基础竞价 + CPC）、搜索词、自动/ASIN 投放、广告商品。缺哪层就标 `DATA_MISSING`，不要用活动汇总代替。
-3. **单变量阶梯调控与防双重抑制铁律 (Anti-Double-Damping Rule)。** 严禁在同一次调整中，既对活动位置溢价大幅削减（如 TOS 250% -> 60%），又同时对活动广告组或关键词基础竞价大幅砍价（-20%~-30%）！真实数据证明，同时砍溢价与竞价（双重抑制 Double-Damping）会导致词条在亚马逊底层拍卖竞价中被瞬间打穿出局，引发日均曝光断崖暴跌（-80%~-99.4%），使全店总单量与销售额失速（如历史实战断流案例教训）。必须执行单变量阶梯调控：第一步先拉平畸形位置溢价（TOS 降至正常水平），基础竞价必须基于市场出单底价 $\text{Base Bid} = \text{round}\left(\frac{\text{Baseline CPC}}{1 + \frac{\text{New TOS}}{100}}, 2\right)$ 科学倒推托底，严禁任由有效出价腰斩；第二步给予 3 天微观切片观察，仅当曝光稳定而实际 CPC 仍显著高于保本目标时，再微调基础竞价。
+3. **单变量阶梯调控与防双重抑制铁律 (Anti-Double-Damping Rule)。** 严禁在同一次调整中，既对活动位置溢价大幅削减（如 TOS 250% -> 60%），又同时对活动广告组或关键词基础竞价大幅砍价（-20%~-30%）！真实数据证明，同时砍溢价与竞价（双重抑制 Double-Damping）会导致词条在亚马逊底层拍卖竞价中被瞬间打穿出局，引发日均曝光断崖暴跌（-80%~-99.4%），使全店总单量与销售额失速（如历史实战断流案例教训）。**代码底层强制互斥锁 (Code-Level Mutex Lock)**：`analyze_ads_bundle.py` 脚本强制锁定——凡当期发生位置溢价调整（TOS/PP/ROS 变更）的活动，所有针对该活动关键词或广告组的降竞价指令（`Lower_Bid`, `Throttle_TOS_Bid`, `Throttle_Cannibalization_Bid`）自动被系统拦截并转换为 `Anti_Double_Damping_Hold`（双重抑制拦截·保持当前出价观察），严禁在同一份 TSV 中既砍溢价又砍竞价！必须执行单变量阶梯调控：第一步先拉平畸形位置溢价（TOS 降至正常水平），基础竞价必须基于市场出单底价 $\text{Base Bid} = \text{round}\left(\frac{\text{Baseline CPC}}{1 + \frac{\text{New TOS}}{100}}, 2\right)$ 科学倒推托底，严禁任由有效出价腰斩；第二步给予 3-7 天微观切片观察，仅当曝光稳定而实际 CPC 仍显著高于保本目标时，再微调基础竞价。
 4. **长短双轨制与鲜活切片数据（宏观 30 天定词性与漏斗，微观 7 天/3 天定调价与动态纠偏，拒绝拿历史平均当现状）。**
    - **数据时效与鲜活切片**：必须拉取截至昨天的最新鲜活切片，包含 30 天全量基线（`macro_30d`）、近 7 天走势（`recent_7d`）与近 3 天调后切片（`recent_3d`）。在报告开头和每个活动明确展示数据时间戳与分段切片，严禁提供来源不明或模糊过时的平均数。
    - **分工边界**：
      - **30 天宏观基线**：用于意图分桶（IS / IS NOT）、N-Gram 词根累积损耗（高置信度词组否定）、移词漏斗穿透审计；
      - **近 7 天 / 近 3 天微观切片**：用于衡量当前实际有效 CPC、最新转化率与曝光流速。
-   - **动态差分纠偏（Delta Metrics）**：
-     - 给出竞价与溢价建议时，必须对比 $\Delta \text{CPC}$ 与 $\Delta \text{Imp}$，依据调整后的最新变化轨迹纠偏，绝不拿被稀释的历史 30 天均值覆盖当前现状！
+   - **实体级高精动态差分纠偏（Entity-Level Delta Metrics）**：
+     - 给出竞价与溢价建议时，必须对比具体实体（关键词/投放目标）自身的 $\Delta \text{CPC}$ 与 $\Delta \text{Imp}$，依据调整后的最新变化轨迹纠偏，绝不拿被稀释的历史 30 天均值覆盖当前现状，亦不拿活动大盘噪音掩盖单一关键词的真实表现！
      - 若前期调价后近 3 天 CPC 已显著下降（$\Delta \text{CPC} \le -15\%$）且曝光稳定，判定为**【调后生效·见效保持】**，严禁再次砍价，保持稳态；
-     - 若调价后近 3 天日均曝光断崖跌 >70%，判定为**【调后休克断流】**，立即触发熔断并回踩探底（+10%~+15%）。
+     - 若调价后近 3 天日均曝光断崖跌 >70%，判定为**【调后休克断流】**，立即触发熔断并执行基于历史基线 CPC 与当前 TOS 精确倒推的科学回踩探底。
 5. **分层级位置溢价矩阵，同类型活动一套数 (Layered Placement Multiplier Matrix)。** 严禁全账户无论活动类型（精准、自动、竞品、广泛）一刀切执行完全相同的 TOS/PP/ROS！真实数据证明，不同角色活动拥有截然不同的广告位杠杆与流量使命，机械拉平会严重扭曲机制：
    - **精准收割仓 (Exact Proving)**：高 TOS（40%~70%）、低 PP（0%~10%）、低 ROS（10%~30%）——重兵抢占首屏顶部促成转化；
    - **自动探索仓 (Auto Discovery)**：低 TOS（10%~30%）、低 PP（0%~10%）、平衡 ROS（0%~20%）——以极低 CPC 网罗全网宽泛搜索词，禁止虚高 TOS 导致单次点击成本暴涨；
@@ -88,6 +88,7 @@ metadata:
     - **彻底告别聊天窗口记忆依赖**：大模型对话窗口是瞬态终端，不可作为业务记忆数据库。系统在工作区根目录下统一维护 `db/` 本地数据库（包含 `db/daily_records/` 每日档案、`db/ledger/` 历史调优台账、`db/snapshots/` 状态快照）。
     - **每日自动归档截面**：分析脚本运行后，自动在 `db/daily_records/{KEY}_{YYYYMMDD}.json` 中存入当日全域数据截面（包含店铺、ASIN、大盘流量、各活动当日与切片指标）。
     - **持久化调控台账**：系统在 `db/ledger/{KEY}_ledger.json` 与 `.tsv` 中永久追加记录每一笔调整事件（活动名、调整对象、改前值 $\to$ 改后值、发生时的基线 CPC/曝光/ACOS）。
+    - **实体级高精对账归因 (Entity-Level Precision Ledger)**：调优台账深度穿透至具体实体层级（记录 `entity_id`、`target_name`、`entity_type`、改前该实体的 3d/7d/30d CPC 与曝光切片基线）。跨会话对账时，精准对比该关键词或投放项本身的 $\Delta \text{CPC}\%$ 与 $\Delta \text{Imp}\%$，彻底剔除全活动其他词条带来的统计稀释与假性断流误判！
     - **跨会话自动归因对账**：在新开任何会话窗口体检时，脚本自动读取该台账，并将调前基线与今日最新 3 天/7 天切片指标进行对账，自动算出 $\Delta \text{CPC}\%$、$\Delta \text{Imp}\%$ 与调后状态（`【调后生效·见效保持】` / `【断流休克熔断】` / `【失血暴冲熔断】` / `【动态观察期】`）。
     - **报告强制第 2 节对账**：交付的体检手册第 2 节必须完整展示《历史调控台账与调后效果复盘对账总表》，彻底打通跨窗口的历史记忆断层！
 23. **绝对排除已暂停实体（活动/广告组/关键词/商品投放，严禁向停运对象提调价建议）。**
@@ -106,7 +107,7 @@ metadata:
 27. **Listing 流量底盘承接力与自然位缓冲厚度分级 (Listing Organic Readiness Index)。** 真实多期数据证明，不同商品由于自然流量基础与页面评价壁垒不同，对广告调价承受力存在天壤之别：
     - **成熟飞轮型 (`ORGANIC_FLYWHEEL`)**（如成熟飞轮型单品：Nature CVR >= 5.0%，Adv Share <= 75%，Rating >= 4.2）：自然位缓冲厚，果断压缩泛流与畸形 TOS 不会造成大盘坍塌，反而能释放自然流量飞轮，销售额可扩张 30%+，净利润激增；
     - **脆弱失速型 / 纯广告依赖型 (`ORGANIC_FRAGILE`)**（如脆弱依赖型单品：Nature CVR <= 1.0%，Adv Share >= 90%~130%，Rating < 4.0 或退款率 >15%）：几乎 100% 依赖广告推力，自然位缓冲为零。严禁粗暴执行全账户大幅砍 TOS（250% -> 60%）与砍竞价的双重抑制（Double-Damping），否则会导致全店曝光暴跌 90%+、单量失速。代码底层强制约束：对脆弱型 Listing 执行**单变量阶梯微调（单次 TOS 下调幅度严格受限 <= 30%，如下调至 `max(40, TOS*0.70)`）**，并维持基础竞价托底，将预算平稳向**具体细分卖点精准词（如细分特征词投产逆势爆发 ACOS 15.6%）**转移，绝不可粗暴断水。
-28. **自动广告展位漂移与防失血暴冲机制 (Auto Campaign Placement Drift Guardrail)。** 真实数据证明：当对自动广告大幅削减首屏 TOS 溢价时，系统未消耗的预算会瞬间大量倾泻至商品详情页（PP），触发展位漂移，导致自动匹配巨量高单价竞品 ASIN，引发实际 CPC 暴涨 +50%~+72% 的“调后失血暴冲”。规避铁律：下调自动活动 TOS 时，**必须同步将商品页（PP）与其余位（ROS）溢价约束在 <=15%~20%，并同步联动下调广告组默认竞价 20%~25% 或下调日预算**，杜绝资金漂移漏水！
+28. **自动广告展位漂移与防失血暴冲机制 (Auto Campaign Placement Drift Guardrail)。** 真实数据证明：当对自动广告大幅削减首屏 TOS 溢价时，系统未消耗的预算会瞬间大量倾泻至商品详情页（PP），触发展位漂移，导致自动匹配巨量高单价竞品 ASIN，引发实际 CPC 暴涨 +50%~+72% 的“调后失血暴冲”。规避铁律：下调自动活动 TOS 时，**必须同步将商品页（PP）与其余位（ROS）溢价约束在 <=15%~20%，并同步联动下调广告组默认竞价 20%~25% 或下调日预算**，杜绝资金漂移漏水！**代码底层自动联动调控 (`Anti_Drift_Base_Bid_Throttle`)**：在削减自动或广泛活动 TOS 溢价时，`analyze_ads_bundle.py` 自动在输出的调整表中生成一条联动指令：将该活动广告组默认基础竞价同步下调 20%（若无显式设置则基于基线 CPC 下调），并硬性将 PP/ROS 溢价收敛至 $\le 15\%$，从系统层面完全阻断预算向商品页或其余位泄洪引发的高价 ASIN 乱抓！
 29. **负向资产收割前置免疫过滤与物理属性防爆雷 (Strict Exclusion of Physical Misfits in Negative Audits)。** 审计历史已生效否定词时，严禁仅凭 ABA 搜索排名梯队（如 `searchrank < 35000`）或包含品类通用词（如 coffee maker）就将其归类为“孤儿资产”并建议收割！真实案例教训：滴滤机运营此前主动否定的“无塑料（no plastic）”、“全玻璃（all glass）”、“5杯（5 cup）”均为确凿物理冲突词，盲目收割会导致买家退货与 1 星差评。必须执行前置免疫过滤：凡匹配 `IS NOT` 规则或物理冲突特征词，一律判定为永久有效否定（`SAFE_HARD_NEGATIVE`），严禁输出收割建议！
 30. **批量调整表绝对数值与 LingXing 可上传标准 (Direct-Executable TSV Standard)。** 交付的 `bulk_adjustments.tsv` 必须为运营提供 100% 零修改、直接支持领星系统批量导入的规范数据表：严禁在表中出现“当前下调出价”、“+10%~+15%”、“Promote to Dedicated Exact Campaign”等文本占位符；所有竞价调优（包括熔断回踩探底 `Probe_Bid_Recovery` 与移词收割 `Harvest_To_Exact`）必须根据基准竞价精确计算出具体的绝对美元金额（如 `$0.44`）；所有收割动作的目标活动列必须自动绑定目标精准收割仓（`harvest_camp`），严禁填入原广泛活动；严禁出现原活动为精准仓时的“自己收割自己”逻辑死循环。
 31. **出单词防误杀与多用途属性最高豁免权 (Proven Converters Murder Protection & Multi-Purpose Exemption)。** 真实多期数据血泪教训：历史已验证出单 23 单、ACOS 19.2% 的跨界核心主力词（如兼作香料研磨的 `spice grinder`），因命中机械硬编码正则被强行暂停，导致该单品随后大盘销售额雪崩 -$4,000、广告单量从 898 单腰斩至 531 单（-40.9%）！铁律规范：凡历史真实成交出单（`orders >= 2` 或 `cvr >= 5% 且 spend >= $10`）且投产良好（`ACOS <= 保本ACOS`）的投放词，享有系统最高豁免权！严禁任何硬编码正则是/非属性规则对其直接生成 `Pause_Keyword` 或 `Negative_Exact`。遇磨豆机兼香料、咖啡机兼冷萃等跨界词，自动标记为 `MULTI_PURPOSE_PROVEN_HERO`，维持精准投放并锁定基础竞价。
@@ -162,7 +163,14 @@ metadata:
     - **联动治理动作**：报告首页强制触发 `[CRITICAL_REFUND_ALERT]` 红字预警，自动将目标 ACOS 上限定位收紧 20%，停止一切宽泛拓词，将所有预算收敛至退款率较低的核心精准主粮词，并强制输出“产品质量/页面宣传偏差专项排查建议”，杜绝只在广告端做徒劳调参。
 44. **脆弱型 Listing 流量底盘阶梯保护与置换式调优 (Fragile Listing Traffic Floor Guardrail & Replacement Optimization)。**
     - **流量底盘不可替代性**：对脆弱广告依赖型 Listing（Nature CVR $< 1.5\%$，AdvShare $\ge 85\%$），广告是其唯一维持自然排位与小时出单速度的进水管。严禁执行“全账户大面积降预算砍竞价”的休克疗法；
+    - **代码底层 $0.30 硬性地板保护 (Hard Bid Floor Protection)**：对于标记为 `ORGANIC_FRAGILE` 或退款率 $\ge 12.0\%$ 的 Listing，代码底层自动设定基础竞价保底绝对下限为 `$0.30`（普通活动为 `$0.25`）。严禁任何下调出价建议将基础竞价击穿至 `$0.30` 以下，防止脆弱型产品彻底跌出亚马逊底层拍卖展示池导致单量崩溃；
     - **流量置换式调优（Traffic Replacement SOP）**：单次调整 TOS 下调幅度严格受限 $\le 25\%$，基础竞价保持托底。砍掉无效宽泛流血词的同时，必须在同日等量补充已验证的细分卖点精准词（如 single dose / spice），用高投产词流平稳置换低效词流，确保大盘总进水速度不失速。
+45. **多店铺与多账号空间隔离命名法 (Multi-Shop & Profile Namespace Isolation Rule)。**
+    - 当管理多店铺或多账号共享相同 Portfolio ID 时，快照与台账文件统一采用 `{shop_alias}_portfolio_{portfolio_id}` 命名空间隔离；
+    - 脚本通过 `--shop` 参数自动隔离不同店铺的数据缓存、快照与调控历史，同时向后兼容无店铺前缀的旧版历史文件，杜绝跨店铺台账污染与快照碰撞。
+46. **大盘流量降级重试与多源财务对齐韧性机制 (Traffic Data Fallback & Graceful Interpolation Rule)。**
+    - 当领星 API 发生流量数据波动（如业务报告 Sessions 返回空 `{}` 或 0）时，系统自动降级回退至最近一个历史每日快照档案 (`daily_records/`) 填充访客流速，严禁盲目输出 0 sessions 导致 TACOS 虚假清零；
+    - 系统强制采用真实订单财务数据 (`ad_cost / sales * 100`) 进行交叉对账核算，确保流量漏斗与 TACOS 评估的绝对连续与可靠。
 
 ## 必做流程
 
@@ -177,15 +185,39 @@ metadata:
 - 本会话若**没有**原生 MCP tools，不要停：用 `scripts/lx_client.py` 走 HTTP JSON-RPC（`help` / `search` / `action`）。
 - 连不上就告诉用户怎么贴 MCP 配置（白名单以后再说），不要改用过期截图或仓库旧数冒充当前表现。
 
-### 2. 取数与证据生成
+### 2. 广告组合专属工作区定位与取数生成 (Portfolio-First Architecture)
 
-在当前工作目录跑（把 ASIN/国家换成用户给的）。脚本在 skill 根目录：
+**铁律：严禁直接在项目根目录倾倒散落文件或输出报告！每一个广告组合必须拥有完全独立的专属工作目录。**
 
-```bash
-# Windows PowerShell 或 Bash:
-python ~/.gemini/config/skills/lingxing-ads-playbook/scripts/fetch_ads_bundle.py --asin <ASIN> --country <COUNTRY> --outdir work/lx-ads
-python ~/.gemini/config/skills/lingxing-ads-playbook/scripts/analyze_ads_bundle.py --indir work/lx-ads --outdir work/lx-ads/analysis --export-dir outputs
-```
+无论手动在会话中执行，还是定时任务自动触发：
+1. **确定广告组合工作区**：
+   - 基础项目路径为：`E:\shardor\antigravity\领星广告`
+   - 目标专属目录为：`E:\shardor\antigravity\领星广告\<广告组合名>\`（例如 `E:\shardor\antigravity\领星广告\UL-SP-7437-2-SR-DL202509US-cheng\`）
+   - 若用户仅提供了 ASIN 与国家，先通过工具或 Listing 反查该商品所属的广告组合名称；
+   - 若该专属文件夹尚未建立，**系统必须自动初始化目录结构**（包含 `outputs/`、`db/daily_records/`、`db/ledger/`、`db/snapshots/`、`work/lx-ads/` 与 `README.md`）。
+2. **标准一体化运行命令（推荐）**：
+   使用内置工作区自动化调度器，一行命令自动完成新组合建档、数据拉取、深度分析与台账对账：
+   ```bash
+   # Windows PowerShell 或 Bash:
+   python ~/.gemini/config/skills/lingxing-ads-playbook/scripts/run_portfolio_audit.py --portfolio <广告组合名> --asin <ASIN> --country <COUNTRY> --shop <SHOP>
+   ```
+3. **分步运行命令（备选）**：
+   若需分步调试，各环节路径必须显式绑定该广告组合目录，禁止使用根目录相对路径：
+   ```bash
+   # 1. 抓取活数据到该组合专属工作目录
+   python ~/.gemini/config/skills/lingxing-ads-playbook/scripts/fetch_ads_bundle.py \
+       --asin <ASIN> --country <COUNTRY> --shop <SHOP> --portfolio <广告组合名> \
+       --outdir "E:/shardor/antigravity/领星广告/<广告组合名>/work/lx-ads" \
+       --db-dir "E:/shardor/antigravity/领星广告/<广告组合名>/db"
+
+   # 2. 深度分析与证据产出到该组合专属工作目录
+   python ~/.gemini/config/skills/lingxing-ads-playbook/scripts/analyze_ads_bundle.py \
+       --indir "E:/shardor/antigravity/领星广告/<广告组合名>/work/lx-ads" \
+       --outdir "E:/shardor/antigravity/领星广告/<广告组合名>/work/lx-ads/analysis" \
+       --db-dir "E:/shardor/antigravity/领星广告/<广告组合名>/db" \
+       --snapshots-dir "E:/shardor/antigravity/领星广告/<广告组合名>/db/snapshots" \
+       --export-dir "E:/shardor/antigravity/领星广告/<广告组合名>/outputs"
+   ```
 
 - **全品类通用性**：脚本默认从后台 Listing 标题、品牌词、属性、小类 BSR 中自动构建画像分桶，无缝兼容任何商品、任何类目（3C、小家电、户外、服装、美妆等）。
 - **自定义规则（可选）**：若需对特定商品自定义精准 IS/IS_NOT/竞品词，可传入 `--rules path/to/product_rules.json`（参考 `references/product-rules-template.json`）。
@@ -235,7 +267,7 @@ python ~/.gemini/config/skills/lingxing-ads-playbook/scripts/analyze_ads_bundle.
 
 聊天里给：目标、今天止血清单、明天基础竞价、核心否定词（含精准否定与词根词组否定）、3/7 天验收。
 
-完整手册写到 `outputs/{ASIN}-{country}-ads-playbook-{YYYYMMDD-HHmmss}.md`（同时配套输出 `outputs/{ASIN}-{country}-bulk-adjustments-{YYYYMMDD-HHmmss}.tsv`）。必须按 [report-template.md](references/report-template.md) 写全，严禁覆盖历史旧文件，确保多期可比。
+完整手册必须写到该组合专属目录 outputs 内部：`E:/shardor/antigravity/领星广告/<广告组合名>/outputs/{ASIN}-{country}-ads-playbook-{YYYYMMDD-HHmmss}.md`（同时配套输出 `E:/shardor/antigravity/领星广告/<广告组合名>/outputs/{ASIN}-{country}-bulk-adjustments-{YYYYMMDD-HHmmss}.tsv`）。严禁将报告写到根目录 outputs/ 或 scratch 目录，确保多期历史在对应组合内完整沉淀。若是新广告组合，自动在 `E:/shardor/antigravity/领星广告/PORTFOLIO_INDEX.md` 中追加登记索引行。必须按 [report-template.md](references/report-template.md) 写全，严禁覆盖历史旧文件，确保多期可比。
 配套提供可直接用于系统批量上传的 `bulk_adjustments.tsv` 清单。
 
 写位置溢价时：先定总表，再把同一行数字复制进该活动详情。不要在详情里“顺便改一版”。
