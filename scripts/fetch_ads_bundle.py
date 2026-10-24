@@ -410,6 +410,133 @@ def log_fetch_history(db_dir: str | None, outdir: Path, meta: dict) -> None:
         pass
 
 
+def probe_deal_and_promotions(asin: str, country: str, sid: str, msku: str, window: str, outdir: Path) -> dict:
+    """Probe Deal / Lightning Deal / Promotion markers across xydc-mcp and LingXing-MCP."""
+    deal_info = {
+        "asin": asin,
+        "country": country,
+        "has_deal_history": False,
+        "is_deal_transition": False,
+        "days_since_last_deal": None,
+        "last_deal_date": None,
+        "deal_days": [],
+        "coupon_days": [],
+        "prime_days": [],
+        "promotion_days": [],
+        "sec_kill_records": [],
+        "prime_discount_records": [],
+        "financial_promotions": {
+            "promotion_discount": 0.0,
+            "promotion_amount": 0.0,
+            "promotion_volume": 0,
+            "sp_discount": 0.0,
+            "promotion_fee": 0.0,
+        },
+        "summary_badge": "NONE",
+        "summary_desc": "近期无活跃秒杀/促销活动记录",
+    }
+
+    # 1. Probe Xiyou Dongcha (xydc-mcp) get_asin_info_trends
+    try:
+        import xydc_client as xydc
+        xydc_deal = xydc.fetch_asin_deal_trends(asin, country=country, days=30)
+        if xydc_deal:
+            deal_info["deal_days"] = xydc_deal.get("deal_days", [])
+            deal_info["coupon_days"] = xydc_deal.get("coupon_days", [])
+            deal_info["prime_days"] = xydc_deal.get("prime_days", [])
+            deal_info["promotion_days"] = xydc_deal.get("promotion_days", [])
+            if xydc_deal.get("has_deal_history"):
+                deal_info["has_deal_history"] = True
+            if xydc_deal.get("is_deal_transition"):
+                deal_info["is_deal_transition"] = True
+                deal_info["days_since_last_deal"] = xydc_deal.get("days_since_last_deal")
+                deal_info["last_deal_date"] = xydc_deal.get("last_deal_date")
+    except Exception as exc:
+        print(f"[xydc-mcp] Optional deal trend probe skipped: {exc}", file=sys.stderr)
+
+    # 2. Probe LingXing sales_detail_sec_kill & sales_detail_prime_discount
+    if sid and msku:
+        try:
+            start_date, end_date = split_window(window) if window else ("", "")
+            start_time = f"{start_date} 00:00:00" if start_date else ""
+            end_time = f"{end_date} 23:59:59" if end_date else ""
+
+            # Sec Kill (秒杀)
+            sk_res = lx.action("sales_detail_sec_kill", {
+                "storeId": str(sid),
+                "sellerSku": str(msku),
+                "startTime": start_time,
+                "endTime": end_time,
+                "sortField": "startTime",
+                "sortType": "desc",
+                "pageNum": 1,
+                "pageSize": 20,
+            })
+            if isinstance(sk_res, dict):
+                data_obj = sk_res.get("data", {})
+                if isinstance(data_obj, dict):
+                    inner_data = data_obj.get("data", {})
+                    records = inner_data.get("records") if isinstance(inner_data, dict) else None
+                    if records and isinstance(records, list):
+                        deal_info["sec_kill_records"] = records
+                        deal_info["has_deal_history"] = True
+
+            # Prime Discount (优惠券 / Prime专享折扣)
+            pd_res = lx.action("sales_detail_prime_discount", {
+                "storeId": str(sid),
+                "sellerSku": str(msku),
+                "startTime": start_time,
+                "endTime": end_time,
+                "sortField": "startTime",
+                "sortType": "desc",
+                "pageNum": 1,
+                "pageSize": 20,
+            })
+            if isinstance(pd_res, dict):
+                data_obj = pd_res.get("data", {})
+                if isinstance(data_obj, dict):
+                    inner_data = data_obj.get("data", {})
+                    records = inner_data.get("records") if isinstance(inner_data, dict) else None
+                    if records and isinstance(records, list):
+                        deal_info["prime_discount_records"] = records
+                        deal_info["has_deal_history"] = True
+        except Exception as exc:
+            print(f"[LingXing-MCP] Optional sec_kill probe skipped: {exc}", file=sys.stderr)
+
+    # 3. Read accounting financial discounts from order_profit.json and product_performance.json
+    try:
+        prof_file = outdir / "order_profit.json"
+        if prof_file.exists():
+            prof_data = json.loads(prof_file.read_text(encoding="utf-8"))
+            row = prof_data[0] if isinstance(prof_data, list) and prof_data else (prof_data if isinstance(prof_data, dict) else {})
+            deal_info["financial_promotions"]["promotion_discount"] = float(row.get("promotion_discount") or 0.0)
+            deal_info["financial_promotions"]["promotion_fee"] = float(row.get("promotion_fee") or 0.0)
+            deal_info["financial_promotions"]["sp_discount"] = float(row.get("sp_discount") or 0.0)
+
+        perf_file = outdir / "product_performance.json"
+        if perf_file.exists():
+            perf_data = json.loads(perf_file.read_text(encoding="utf-8"))
+            row = perf_data[0] if isinstance(perf_data, list) and perf_data else (perf_data if isinstance(perf_data, dict) else {})
+            deal_info["financial_promotions"]["promotion_amount"] = float(row.get("promotion_amount") or 0.0)
+            deal_info["financial_promotions"]["promotion_volume"] = int(row.get("promotion_volume") or 0)
+    except Exception:
+        pass
+
+    # Summary badge & description
+    if deal_info["is_deal_transition"]:
+        deal_info["summary_badge"] = "DEAL_TRANSITION"
+        deal_info["summary_desc"] = f"检测到商品于 {deal_info['last_deal_date']} (约 {deal_info['days_since_last_deal']} 天前) 结束秒杀/促销活动，当前处于秒杀结束后的流量回落常态期"
+    elif deal_info["deal_days"]:
+        deal_info["summary_badge"] = "ACTIVE_DEAL"
+        deal_info["summary_desc"] = "商品当前或近期处于秒杀活动进行期"
+    elif deal_info["financial_promotions"]["promotion_discount"] < -5.0 or deal_info["coupon_days"]:
+        deal_info["summary_badge"] = "COUPON_OR_PROMOTION"
+        deal_info["summary_desc"] = f"近期存在促销/优惠券活动 (折让额: ${abs(deal_info['financial_promotions']['promotion_discount']):.2f})"
+
+    save(outdir / "deal_info.json", deal_info)
+    return deal_info
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--asin", required=True)
@@ -494,6 +621,15 @@ def main() -> int:
             print("[xydc-mcp] No rank records returned or xydc-mcp not responding.")
     except Exception as exc:
         print(f"[xydc-mcp] Optional rank intelligence skipped: {exc}", file=sys.stderr)
+
+    # Deal & Promotion Markers across xydc-mcp & LingXing-MCP
+    print(f"[Deal & Promotion] Probing deals, coupons & promotions for ASIN {asin}...")
+    deal_info = probe_deal_and_promotions(asin, country, sid, msku, window, outdir)
+    counts["deal_info"] = 1
+    if deal_info.get("is_deal_transition"):
+        print(f"[Deal & Promotion] Active deal transition detected: {deal_info.get('summary_desc')}")
+    elif deal_info.get("has_deal_history"):
+        print(f"[Deal & Promotion] Deal/promotion history detected: {deal_info.get('summary_desc')}")
 
     product_ads = json.loads((outdir / "product_ads.json").read_text(encoding="utf-8"))
     asin_keys = filter_asin_campaigns(product_ads, asin)

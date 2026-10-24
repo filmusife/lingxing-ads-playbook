@@ -260,6 +260,68 @@ def load_traffic_profile(indir: Path, db_dir: Path | None = None, financial_prof
     }
 
 
+def load_deal_info(indir: Path) -> dict:
+    """Load deal, promotion, and discount intelligence from deal_info.json or infer from accounting files."""
+    p = indir / "deal_info.json"
+    if p.exists():
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    # Fallback: Infer from order_profit.json and product_performance.json if deal_info.json was not pre-fetched
+    inferred = {
+        "asin": "",
+        "country": "",
+        "has_deal_history": False,
+        "is_deal_transition": False,
+        "days_since_last_deal": None,
+        "last_deal_date": None,
+        "deal_days": [],
+        "coupon_days": [],
+        "prime_days": [],
+        "promotion_days": [],
+        "sec_kill_records": [],
+        "prime_discount_records": [],
+        "financial_promotions": {
+            "promotion_discount": 0.0,
+            "promotion_amount": 0.0,
+            "promotion_volume": 0,
+            "sp_discount": 0.0,
+            "promotion_fee": 0.0,
+        },
+        "summary_badge": "NONE",
+        "summary_desc": "无近期秒杀/促销活动记录",
+    }
+    prof_p = indir / "order_profit.json"
+    if prof_p.exists():
+        try:
+            p_data = json.loads(prof_p.read_text(encoding="utf-8"))
+            row = p_data[0] if isinstance(p_data, list) and p_data else (p_data if isinstance(p_data, dict) else {})
+            promo_disc = float(row.get("promotion_discount") or 0.0)
+            inferred["financial_promotions"]["promotion_discount"] = promo_disc
+            inferred["financial_promotions"]["promotion_fee"] = float(row.get("promotion_fee") or 0.0)
+            inferred["financial_promotions"]["sp_discount"] = float(row.get("sp_discount") or 0.0)
+            if promo_disc < -10.0:
+                inferred["has_deal_history"] = True
+                inferred["summary_badge"] = "COUPON_OR_PROMOTION"
+                inferred["summary_desc"] = f"财务账单显示近期有显著促销折让 (${abs(promo_disc):.2f})"
+        except Exception:
+            pass
+
+    perf_p = indir / "product_performance.json"
+    if perf_p.exists():
+        try:
+            perf_data = json.loads(perf_p.read_text(encoding="utf-8"))
+            row = perf_data[0] if isinstance(perf_data, list) and perf_data else (perf_data if isinstance(perf_data, dict) else {})
+            inferred["financial_promotions"]["promotion_amount"] = float(row.get("promotion_amount") or 0.0)
+            inferred["financial_promotions"]["promotion_volume"] = int(row.get("promotion_volume") or 0)
+        except Exception:
+            pass
+
+    return inferred
+
+
 def load_dayparting_analysis(indir: Path) -> tuple[list[dict], list[str]]:
     h_rows = as_rows(load_json(indir / "order_analysis_hourly.json"))
     table_lines = []
@@ -679,12 +741,20 @@ def evaluate_rank_synergy(
     # Tier 2: Organic Rank 4 ~ 15 (Critical Flywheel Ascender)
     elif org_rank is not None and 4 <= org_rank <= 15:
         if (clicks >= 5 and orders >= 1 and actual_acos <= target_acos * 1.35) or (clicks >= 3 and orders >= 1 and actual_acos <= target_acos):
-            tier = "Tier 2: 临界冲刺"
-            tag = "【临界冲刺·拉升自然位】"
-            action_type = "Boost_Ascender_TOS"
-            new_bid = round((current_bid or 0.35) * 1.15, 2)
-            recom = f"基础竞价提升 15% 至 ${new_bid:.2f}，加注 TOS 溢价至 60%-75%"
-            reason = f"自然位在第 {org_rank} 位，正处于冲入前三的临界突破期！该词转化良好（{orders}单，ACOS {actual_acos:.1f}%），加大 SP 抢占首页顶展，通过密集出单拉升小时出单速度，撬动自然位破壁跃升至 Top 3！"
+            if sp_rank == 1:
+                tier = "Tier 2: 顶展霸位"
+                tag = "【广告#1·顶展守位】"
+                action_type = "Defensive_Dominance_Maintain"
+                new_bid = current_bid or 0.35
+                recom = f"广告位已为 SP #1（顶展第一），保持当前基础竞价 ${new_bid:.2f}，锁定 TOS 溢价维持首位"
+                reason = f"自然位在第 {org_rank} 位，而广告位已高居全网 SP #1 顶展位！出价已完全统治首屏，严禁继续盲目加价抬高 CPC，保持当前出价压制竞品，通过小时出单速度持续撬动自然位跃升。"
+            else:
+                tier = "Tier 2: 临界冲刺"
+                tag = "【临界冲刺·拉升自然位】"
+                action_type = "Boost_Ascender_TOS"
+                new_bid = round((current_bid or 0.35) * 1.15, 2)
+                recom = f"基础竞价提升 15% 至 ${new_bid:.2f}，加注 TOS 溢价至 60%-75%"
+                reason = f"自然位在第 {org_rank} 位，正处于冲入前三的临界突破期！该词转化良好（{orders}单，ACOS {actual_acos:.1f}%），加大 SP 抢占首页顶展，通过密集出单拉升小时出单速度，撬动自然位破壁跃升至 Top 3！"
         elif spend >= 15.0 and orders == 0:
             tier = "Tier 2: 冲刺受阻"
             tag = "【冲刺受阻·控频观察】"
@@ -1936,6 +2006,8 @@ def load_and_sync_ledger(
     curr_kw_map: dict | None = None,
     curr_target_map: dict | None = None,
     cooldown_days: int = 7,
+    xydc_map: dict | None = None,
+    deal_info: dict | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """Load persistent ledger, seed from snapshot cooldowns if new, append new diffs,
     and dynamically attribute post-adjustment performance (Delta CPC, Delta Imp, Verdict).
@@ -2087,13 +2159,30 @@ def load_and_sync_ledger(
                 verdict = "【调后生效·见效保持】"
                 advice = "见效保持，严禁二次砍价"
             elif delta_imp <= -70.0 and (not matching_camp or matching_camp.get("ord_3d", 0) == 0):
-                verdict = "【调后休克断流】"
-                baseline_cpc = base_cpc or (matching_camp.get("cpc", 0.50) if matching_camp else 0.50)
-                cur_tos = num(matching_camp.get("tos", 0)) if matching_camp else 0
-                cur_bid = num(re.sub(r"[^\d.]", "", str(item.get("new_val") or "0")))
-                target_bid = max(0.25, round(baseline_cpc / (1.0 + (cur_tos / 100.0)), 2))
-                probe_bid = max(round(cur_bid * 1.15, 2), target_bid)
-                advice = f"立即科学倒推回踩探底至 ${probe_bid:.2f} 激活展示池"
+                # Position & Deal Transition Guardrail
+                entity_kw = str(item.get("entity_name") or "").lower().strip()
+                clean_term = re.sub(r"\s*\[.*?\]", "", entity_kw).strip()
+                r_info = xydc_map.get(clean_term) if xydc_map else None
+                if not r_info and xydc_map:
+                    r_info = xydc_map.get(re.sub(r"[^\w\s]", "", clean_term).strip())
+                sp_r = r_info.get("sp_rank") if r_info else None
+                is_top_rank = (sp_r is not None and int(sp_r) <= 3) or (matching_camp and matching_camp.get("assessment") == "TOP_POSITION_MARKET_COOLDOWN")
+                is_deal_trans = bool(deal_info and deal_info.get("is_deal_transition")) or (matching_camp and matching_camp.get("assessment") == "DEAL_TRANSITION_COOLDOWN")
+
+                if is_top_rank:
+                    verdict = "【首屏黄金位·常态冷却】"
+                    advice = f"核心词广告位已稳居首屏顶部(SP #{sp_r or 1})，曝光回落非出价脱靶，严禁加价回踩，保持当前出价观察"
+                elif is_deal_trans:
+                    verdict = "【秒杀后流量回落·常态冷却】"
+                    advice = "近期结束秒杀/促销活动，曝光回落系常态均值回归，严禁误判断流，保持当前出价观察"
+                else:
+                    verdict = "【调后休克断流】"
+                    baseline_cpc = base_cpc or (matching_camp.get("cpc", 0.50) if matching_camp else 0.50)
+                    cur_tos = num(matching_camp.get("tos", 0)) if matching_camp else 0
+                    cur_bid = num(re.sub(r"[^\d.]", "", str(item.get("new_val") or "0")))
+                    target_bid = max(0.25, round(baseline_cpc / (1.0 + (cur_tos / 100.0)), 2))
+                    probe_bid = max(round(cur_bid * 1.15, 2), target_bid)
+                    advice = f"立即科学倒推回踩探底至 ${probe_bid:.2f} 激活展示池"
             elif delta_cpc >= 40.0:
                 verdict = "【调后失血暴冲】"
                 advice = "紧急下调溢价/竞价控费"
@@ -2272,6 +2361,7 @@ def load_product_context(args, dest, src):
     # Load Advanced Intelligence Profiles
     financial_prof = load_financial_profile(src)
     traffic_prof = load_traffic_profile(src, db_dir=args.db_dir, financial_prof=financial_prof)
+    deal_info = load_deal_info(src)
     dayparting_records, dayparting_table_lines = load_dayparting_analysis(src)
 
     if financial_prof:
@@ -2283,6 +2373,11 @@ def load_product_context(args, dest, src):
         profile["traffic_profile"] = traffic_prof
         dest.joinpath("traffic_profile.json").write_text(
             json.dumps(traffic_prof, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    if deal_info:
+        profile["deal_info"] = deal_info
+        dest.joinpath("deal_info.json").write_text(
+            json.dumps(deal_info, ensure_ascii=False, indent=2), encoding="utf-8"
         )
     if dayparting_table_lines:
         tsv(
@@ -2324,7 +2419,7 @@ def load_product_context(args, dest, src):
         json.dumps(profile, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
-    return dayparting_records, dayparting_table_lines, financial_prof, gen_time_str, meta, profile, rules, target_acos, traffic_prof
+    return dayparting_records, dayparting_table_lines, financial_prof, gen_time_str, meta, profile, rules, target_acos, traffic_prof, deal_info
 
 def load_report_frames(meta, profile, src):
     """Load every ads report, scope it to this ASIN's campaigns, and attach 7d/3d deltas."""
@@ -2431,7 +2526,7 @@ def load_report_frames(meta, profile, src):
 
     return asin_campaigns, camps, kws, kws_3d, kws_7d, targets, targets_3d, targets_7d
 
-def run_state_tracking(args, camps, dayparting_records, financial_prof, kws, meta, profile, src, targets, traffic_prof, kws_3d=None, kws_7d=None, targets_3d=None, targets_7d=None):
+def run_state_tracking(args, camps, dayparting_records, financial_prof, kws, meta, profile, src, targets, traffic_prof, kws_3d=None, kws_7d=None, targets_3d=None, targets_7d=None, xydc_map=None, deal_info=None):
     """Diff control variables against the last snapshot, sync the ledger, and archive today's record."""
     # --------------------------------------------------------------------------
     # Database, Snapshot & Persistent Ledger Execution
@@ -2472,6 +2567,7 @@ def run_state_tracking(args, camps, dayparting_records, financial_prof, kws, met
         ledger_file, prev_snapshot, new_diff_items, camps,
         curr_kw_map=curr_kw_map, curr_target_map=curr_target_map,
         cooldown_days=args.cooldown_days,
+        xydc_map=xydc_map, deal_info=deal_info,
     )
     for cd in active_cooldowns:
         if cd.get("campaign"):
@@ -2508,7 +2604,7 @@ def write_campaigns_tsv(camps, dest):
     )
 
 
-def assess_and_write_placements(active_cooldowns, args, camps, dest, locked_campaigns, target_acos, traffic_prof=None):
+def assess_and_write_placements(active_cooldowns, args, camps, dest, locked_campaigns, target_acos, traffic_prof=None, kws=None, xydc_map=None, deal_info=None):
     """Grade each enabled campaign (circuit breakers, cooldown, placement risk) into placement_audit.tsv."""
     # 2. Output placement_audit.tsv (Multi-Window Dynamic Delta & Adaptive Correction)
     placement_lines = []
@@ -2521,13 +2617,51 @@ def assess_and_write_placements(active_cooldowns, args, camps, dest, locked_camp
         # Effective CPC for forward recommendations is RECENT CPC (cpc_3d > cpc_7d > cpc_30d)
         effective_cpc = c["cpc_3d"] if c["cpc_3d"] > 0 else (c["cpc_7d"] if c["cpc_7d"] > 0 else c["cpc"])
 
+        # Check ad rank in xydc_map for campaign's keywords
+        camp_kws = [k for k in (kws or []) if (k.get("campaign_name") == c["name"] or str(k.get("campaign_id")) == str(c.get("id")))]
+        best_sp_rank = None
+        best_kw = None
+        best_or_rank = None
+        if xydc_map and camp_kws:
+            for kw_obj in camp_kws:
+                kw_str = str(kw_obj.get("keyword_text") or "").strip().lower()
+                r_info = xydc_map.get(kw_str)
+                if not r_info:
+                    r_info = xydc_map.get(re.sub(r"[^\w\s]", "", kw_str).strip())
+                if r_info and r_info.get("sp_rank") is not None:
+                    sp_r = int(r_info["sp_rank"])
+                    if best_sp_rank is None or sp_r < best_sp_rank:
+                        best_sp_rank = sp_r
+                        best_kw = kw_str
+                        best_or_rank = r_info.get("organic_rank")
+
+        # Top ad rank means ad is ALREADY Top of Search
+        is_top_ad_rank = (best_sp_rank is not None and best_sp_rank <= 3) or (best_sp_rank is not None and best_sp_rank <= 5 and c.get("tos_share", 0) >= 50.0)
+        is_deal_trans = bool(deal_info and deal_info.get("is_deal_transition"))
+
         # 1. Post-adjustment Asphyxiation (调后休克断流): Universal check if recent daily imp dropped >70%
         if c["delta_imp_pct"] <= -70.0 and c["daily_imp_30d"] >= 30:
-            assessment = "CIRCUIT_BREAKER_SHOCK"
-            baseline_cpc = c.get("cpc", 0.50)
-            cur_tos = c.get("tos", 0)
-            suggested_bid = max(0.25, round(baseline_cpc / (1.0 + (cur_tos / 100.0)), 2))
-            recom = f"[调后休克断流·立即回踩探底] 近3天日均曝光从 {c['daily_imp_30d']:.0f} 暴跌至 {c['daily_imp_3d']:.0f} ({c['delta_imp_pct']:+.1f}%)；出价降破市场门槛导致断流，打破观察期，建议回提基础竞价至 ${suggested_bid:.2f} 探底拉回展示池"
+            if is_top_ad_rank:
+                assessment = "TOP_POSITION_MARKET_COOLDOWN"
+                c["best_sp_rank"] = best_sp_rank
+                recom = (
+                    f"[首屏黄金位·大盘常态冷却] 近3天日均曝光从 {c['daily_imp_30d']:.0f} 降至 {c['daily_imp_3d']:.0f} ({c['delta_imp_pct']:+.1f}%)；"
+                    f"西柚洞察核验活动核心词广告位仍高居首屏顶部（SP #{best_sp_rank}" + (f" 词: {best_kw}" if best_kw else "") + "），"
+                    "流量变动系大盘/节假日后自然降温或自然搜索波动，出价并未跌破拍卖门槛。广告位已在首屏顶部，严禁盲目加价或回踩探底，保持当前稳态运行"
+                )
+            elif is_deal_trans:
+                assessment = "DEAL_TRANSITION_COOLDOWN"
+                last_d = deal_info.get("last_deal_date") or "近期"
+                recom = (
+                    f"[秒杀后常态冷却·流量异动归因消除] 近3天日均曝光从 {c['daily_imp_30d']:.0f} 降至 {c['daily_imp_3d']:.0f} ({c['delta_imp_pct']:+.1f}%)；"
+                    f"双MCP交叉核验显示商品于 {last_d} 结束秒杀/促销活动，当前回落系促销红利消退后的正常均值回归。绝非广告出价脱靶，严禁误判为断流休克，严禁加价，保持当前出价稳态观察"
+                )
+            else:
+                assessment = "CIRCUIT_BREAKER_SHOCK"
+                baseline_cpc = c.get("cpc", 0.50)
+                cur_tos = c.get("tos", 0)
+                suggested_bid = max(0.25, round(baseline_cpc / (1.0 + (cur_tos / 100.0)), 2))
+                recom = f"[调后休克断流·立即回踩探底] 近3天日均曝光从 {c['daily_imp_30d']:.0f} 暴跌至 {c['daily_imp_3d']:.0f} ({c['delta_imp_pct']:+.1f}%)；出价降破市场门槛导致断流，打破观察期，建议回提基础竞价至 ${suggested_bid:.2f} 探底拉回展示池"
 
         # 2. Post-adjustment Ongoing Bleed (调后持续失血): High spend with 0 orders, or ACOS doubled
         elif (c["spend_3d"] >= 15 and c["ord_3d"] == 0) or (c["spend"] >= 15 and c["ord"] == 0 and c["spend_7d"] >= 10):
@@ -3373,7 +3507,7 @@ def write_negative_tsvs(active_neg_dict, audit_records, dest):
     )
 
 
-def assemble_and_write_adjustments(args, bulk_adjustments, camps, dayparting_records, dayparting_table_lines, dest, financial_prof, gen_time_str, kw_misfit_adjustments, locked_campaigns, meta, profile, target_acos, traffic_prof, unnegative_adjustments, kws=None, xydc_map=None):
+def assemble_and_write_adjustments(args, bulk_adjustments, camps, dayparting_records, dayparting_table_lines, dest, financial_prof, gen_time_str, kw_misfit_adjustments, locked_campaigns, meta, profile, target_acos, traffic_prof, unnegative_adjustments, kws=None, xydc_map=None, deal_info=None):
     """Merge every adjustment source, apply the cooldown lock, dedupe, and write bulk_adjustments.tsv."""
     # 11. Output bulk_adjustments.tsv (Consolidated & Deduplicated with Cooling-off Lock Filter)
     all_final_adjustments = []
@@ -3397,6 +3531,25 @@ def assemble_and_write_adjustments(args, bulk_adjustments, camps, dayparting_rec
         if c["state"] != "enabled":
             continue
         c_assessment = c.get("assessment", "")
+
+        # Position & Deal Transition Protection: Ad is already at Top of Search or Deal just ended!
+        if c_assessment in ("TOP_POSITION_MARKET_COOLDOWN", "DEAL_TRANSITION_COOLDOWN"):
+            base_val = camp_base_bid_map.get(c["name"], 0.30)
+            reason_txt = (
+                f"广告位首屏黄金位保护：核心词广告排名高居首屏顶部（SP #{c.get('best_sp_rank', 1)}），近3天曝光变动 ({c.get('delta_imp_pct', 0):+.1f}%) 属于自然大盘冷却，绝非出价过低脱靶。严禁盲目回踩提价导致无效抬高 CPC，保持基准竞价 ${base_val:.2f} 稳态运行。"
+                if c_assessment == "TOP_POSITION_MARKET_COOLDOWN"
+                else f"秒杀异动保护：商品近期刚结束秒杀/促销活动，近3天曝光变动 ({c.get('delta_imp_pct', 0):+.1f}%) 属于促销红利消退后的正常均值回归。绝非出价脱靶，严禁盲目回踩提价，保持基准竞价 ${base_val:.2f} 稳态运行。"
+            )
+            all_final_adjustments.append({
+                "action_type": "Top_Rank_Cooldown_Hold",
+                "campaign": c["name"],
+                "target_entity": "CampaignBaseBid",
+                "match_type": "bidding",
+                "current_value": f"${base_val:.2f}",
+                "recommended_value": f"${base_val:.2f}",
+                "reason": reason_txt,
+            })
+            continue
 
         # Shock Recovery: Regardless of locked status, if in shock, MUST probe recover!
         if c_assessment == "CIRCUIT_BREAKER_SHOCK":
@@ -3831,7 +3984,7 @@ def write_ledger_files(args, dest, gen_time_str, ledger, ledger_dir, meta, profi
     save_ledger_files(ledger, ledger_dir, snap_key, dest, exp_dir_p, file_prefix, gen_time_str)
 
 
-def write_summary(active_cooldowns, active_neg_dict, asin_campaigns, audit_records, bleeding_ng, camps, cannibal_lines, dayparting_records, deduped_adjustments, dest, diff_events, financial_prof, gen_date_str, gen_time_str, kw_misfit_adjustments, ledger, locked_campaigns, meta, placement_diagnoses, profile, snap_key, sr_map, traffic_prof, xydc_map=None):
+def write_summary(active_cooldowns, active_neg_dict, asin_campaigns, audit_records, bleeding_ng, camps, cannibal_lines, dayparting_records, deduped_adjustments, dest, diff_events, financial_prof, gen_date_str, gen_time_str, kw_misfit_adjustments, ledger, locked_campaigns, meta, placement_diagnoses, profile, snap_key, sr_map, traffic_prof, xydc_map=None, deal_info=None):
     """summary.txt -- the headline numbers the report template reads."""
     # 14. Output summary.txt
     enabled = [c for c in camps if c["state"] == "enabled"]
@@ -3952,6 +4105,11 @@ def write_summary(active_cooldowns, active_neg_dict, asin_campaigns, audit_recor
         summary.append(f"xydc_tier2_ascender_count\t{t2_cnt}")
         summary.append(f"xydc_tier3_breakthrough_count\t{t3_cnt}")
         summary.append(f"xydc_tier4_disconnect_count\t{t4_cnt}")
+    if deal_info:
+        summary.append(f"deal_status_badge\t{deal_info.get('summary_badge', 'NONE')}")
+        summary.append(f"deal_status_desc\t{deal_info.get('summary_desc', '无近期秒杀/促销')}")
+        summary.append(f"deal_is_transition\t{deal_info.get('is_deal_transition', False)}")
+        summary.append(f"deal_last_date\t{deal_info.get('last_deal_date') or '--'}")
     summary.append(f"generation_timestamp\t{gen_time_str}")
     dest.joinpath("summary.txt").write_text("\n".join(summary), encoding="utf-8")
 
@@ -3977,7 +4135,7 @@ def main() -> None:
     dest.mkdir(parents=True, exist_ok=True)
 
     known_negatives = load_known_negatives(args=args, src=src)
-    dayparting_records, dayparting_table_lines, financial_prof, gen_time_str, meta, profile, rules, target_acos, traffic_prof = load_product_context(
+    dayparting_records, dayparting_table_lines, financial_prof, gen_time_str, meta, profile, rules, target_acos, traffic_prof, deal_info = load_product_context(
         args=args,
         dest=dest,
         src=src,
@@ -3987,6 +4145,9 @@ def main() -> None:
         profile=profile,
         src=src,
     )
+    sr_map = load_searchrank_map(src=src)
+    xydc_map = load_xydc_ranks(src=src)
+
     active_cooldowns, daily_records_dir, diff_events, gen_date_str, ledger, ledger_dir, locked_campaigns, snap_key = run_state_tracking(
         args=args,
         camps=camps,
@@ -4002,6 +4163,8 @@ def main() -> None:
         kws_7d=kws_7d,
         targets_3d=targets_3d,
         targets_7d=targets_7d,
+        xydc_map=xydc_map,
+        deal_info=deal_info,
     )
     write_campaigns_tsv(camps=camps, dest=dest)
     assess_and_write_placements(
@@ -4012,6 +4175,9 @@ def main() -> None:
         locked_campaigns=locked_campaigns,
         target_acos=target_acos,
         traffic_prof=traffic_prof,
+        kws=kws,
+        xydc_map=xydc_map,
+        deal_info=deal_info,
     )
     # Archive Daily Record into Database AFTER c['assessment'] is set!
     now_iso = datetime.now().isoformat()
@@ -4019,8 +4185,6 @@ def main() -> None:
         daily_records_dir, snap_key, gen_date_str, now_iso,
         meta, profile, financial_prof, traffic_prof, camps, dayparting_records
     )
-    sr_map = load_searchrank_map(src=src)
-    xydc_map = load_xydc_ranks(src=src)
     write_keywords_tsv(dest=dest, kws=kws, sr_map=sr_map, xydc_map=xydc_map)
     active_neg_dict, all_neg_queries, audit_records, bucket_stats, bulk_adjustments, camp_lookup, cannibal_map, harvest, kw_misfit_adjustments, ngram_stats, placement_diagnoses, st_lines, unnegative_adjustments, waste = analyze_search_terms(
         asin_campaigns=asin_campaigns,
@@ -4096,6 +4260,7 @@ def main() -> None:
         unnegative_adjustments=unnegative_adjustments,
         kws=kws,
         xydc_map=xydc_map,
+        deal_info=deal_info,
     )
     write_observation_status(active_cooldowns=active_cooldowns, camps=camps, dest=dest)
     write_ledger_files(
@@ -4133,6 +4298,7 @@ def main() -> None:
         sr_map=sr_map,
         traffic_prof=traffic_prof,
         xydc_map=xydc_map,
+        deal_info=deal_info,
     )
 
     print(f"Analysis complete. Tables saved to {dest}")

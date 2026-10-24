@@ -171,6 +171,17 @@ metadata:
 46. **大盘流量降级重试与多源财务对齐韧性机制 (Traffic Data Fallback & Graceful Interpolation Rule)。**
     - 当领星 API 发生流量数据波动（如业务报告 Sessions 返回空 `{}` 或 0）时，系统自动降级回退至最近一个历史每日快照档案 (`daily_records/`) 填充访客流速，严禁盲目输出 0 sessions 导致 TACOS 虚假清零；
     - 系统强制采用真实订单财务数据 (`ad_cost / sales * 100`) 进行交叉对账核算，确保流量漏斗与 TACOS 评估的绝对连续与可靠。
+47. **秒杀与促销异动全景排查与虚假断流甄别铁律 (Deal & Promotion Transition De-biasing Rule)。**
+    - **秒杀期与结束期流量机理认知**：商品做秒杀（Lightning Deal / 7-Day Deal / Prime 专享折扣 / 优惠券）时，因红色促销标、类目秒杀页聚合与买家高转化倾向，CTR/CVR 与自然及广告曝光量会大幅冲高；秒杀结束后，流量会自然回落至日常稳态均值。**严禁机械比对近 3 天与近 30 天日均曝光就将秒杀后的正常降温误判为“广告出价被打穿的断流休克”**！
+    - **双 MCP 交叉穿透核验体系**：
+      1. **西柚洞察 (`xydc-mcp`)**：自动调用 `get_asin_info_trends`，全景扫描商品每日价格分布与优惠标记（`deal` 秒杀价、`coupon` 优惠券、`prime` 专享折、`promotion` 管理促销）；
+      2. **领星 ERP (`LingXing-MCP`)**：自动调用 `sales_detail_sec_kill` 与 `sales_detail_prime_discount`，并交叉对账财务利润表中的 `promotion_discount` 促销折让；
+      3. **异动归因消除**：凡识别出近期处于秒杀结束过渡期（`is_deal_transition == True`，活动在近 10 天内结束），系统自动将暴跌归因由“出价过低”纠偏为“秒杀红利消退后的正常均值回归”，判定为 `【秒杀后常态冷却】(DEAL_TRANSITION_COOLDOWN)`，**绝对禁止输出盲目回踩提价指令 (`Probe_Bid_Recovery`)**！
+48. **广告位首屏黄金位真实核验与防过度抬价硬约束铁律 (Top-of-Search Ad Rank Anti-Overbidding Rule)。**
+    - **广告位决定出价上限认知**：广告优化的核心是“买位置”，当一个关键词的广告位已经在首屏顶部（SP Rank $\le 3$ 甚至 SP #1）时，该关键词在亚马逊底层竞价拍卖中已经处于最高统治阶梯，**它在数学上已经不可能通过“提高基础竞价”获得更高的展位**！
+    - **休克断流的广告位前置核验**：当任何关键词或活动近 3 天日均曝光跌幅超过 70% 时，系统必须优先穿透 `xydc_ranks.json`（西柚洞察广告排名 `sp_rank` 与自然排名 `organic_rank`）以及活动顶部展示份额（`tos_share`）：
+      1. **首屏黄金位保护 (`TOP_POSITION_MARKET_COOLDOWN`)**：若该词广告位高居全网首屏顶部（`sp_rank <= 3` 或首屏前列且 `tos_share >= 50%`），曝光回落 100% 属于大盘搜索需求波动、节后降温或秒杀结束，出价并未脱靶！**代码底层强行锁定：禁止触发 `CIRCUIT_BREAKER_SHOCK`，禁止输出 `Probe_Bid_Recovery`，统一输出 `Top_Rank_Cooldown_Hold` 维持基准竞价稳态运行**！
+      2. **SP #1 顶展防内耗限价**：在双轨协同（Rule 38）中，凡关键词广告排名已达 SP #1（顶展第一），严禁继续追加竞价溢价，严防无意义拉高单次点击成本（CPC）引发严重流血。
 
 ## 必做流程
 

@@ -7,6 +7,7 @@ import json
 import os
 import urllib.error
 import urllib.request
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -194,6 +195,86 @@ def fetch_asin_keyword_ranks(
         }
 
     return rank_map
+
+
+def fetch_asin_deal_trends(
+    asin: str,
+    country: str = "US",
+    days: int = 30,
+) -> dict:
+    """Fetch ASIN daily deal, coupon, and price promotion trends from xydc-mcp (get_asin_info_trends)."""
+    end_date = (date.today() - timedelta(days=1)).isoformat()
+    start_date = (date.today() - timedelta(days=days)).isoformat()
+    args = {
+        "asin": asin,
+        "country": country.upper(),
+        "start_date": start_date,
+        "end_date": end_date,
+        "user_task": f"查询商品 {asin} 近期秒杀、Deal与优惠券活动日趋势",
+        "intent_summary": "查询价格、Deal及促销变动日趋势，识别近期是否有秒杀活动及其结束时间",
+    }
+    res = call_xydc_tool("get_asin_info_trends", args)
+    if not res or "error" in res:
+        return {}
+
+    data_block = res.get("data", {})
+    raw_trends = data_block.get("trends", [])
+    if not raw_trends and isinstance(res.get("trends"), list):
+        raw_trends = res.get("trends", [])
+
+    deal_days = []
+    coupon_days = []
+    prime_days = []
+    promo_days = []
+
+    for t in raw_trends:
+        d_str = t.get("date", "")
+        p_dist = t.get("priceDistribution", {})
+        deal_val = str(p_dist.get("deal") or "").strip()
+        coupon_val = p_dist.get("coupon") or []
+        prime_val = str(p_dist.get("prime") or "").strip()
+        promo_val = p_dist.get("promotion") or []
+        display_price = str(p_dist.get("display") or "")
+
+        if deal_val:
+            deal_days.append({"date": d_str, "deal_price": deal_val, "display_price": display_price})
+        if coupon_val:
+            coupon_days.append({"date": d_str, "coupon": coupon_val, "display_price": display_price})
+        if prime_val:
+            prime_days.append({"date": d_str, "prime_price": prime_val, "display_price": display_price})
+        if promo_val:
+            promo_days.append({"date": d_str, "promotion": promo_val, "display_price": display_price})
+
+    has_deal_history = bool(deal_days or prime_days or coupon_days or promo_days)
+    last_deal_date = deal_days[-1]["date"] if deal_days else (prime_days[-1]["date"] if prime_days else None)
+    
+    # Calculate days since last deal ended
+    is_deal_transition = False
+    days_since_deal = None
+    if last_deal_date:
+        try:
+            d_obj = datetime.strptime(last_deal_date, "%Y-%m-%d").date()
+            diff_days = (date.today() - d_obj).days
+            days_since_deal = diff_days
+            # If deal ended within last 10 days, current period is considered deal transition
+            if diff_days <= 10:
+                is_deal_transition = True
+        except Exception:
+            pass
+
+    return {
+        "asin": asin,
+        "country": country.upper(),
+        "query_window": f"{start_date} - {end_date}",
+        "has_deal_history": has_deal_history,
+        "is_deal_transition": is_deal_transition,
+        "days_since_last_deal": days_since_deal,
+        "last_deal_date": last_deal_date,
+        "deal_days": deal_days,
+        "coupon_days": coupon_days,
+        "prime_days": prime_days,
+        "promotion_days": promo_days,
+    }
 
 
 if __name__ == "__main__":
