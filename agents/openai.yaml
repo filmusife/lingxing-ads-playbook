@@ -1,16 +1,20 @@
 interface:
   display_name: "领星广告调整手册"
-  short_description: "Deep Lingxing ads audit and full adjustment playbook"
+  short_description: "Deep Lingxing + Xiyou (xydc-mcp) Amazon ads audit and full 13-section adjustment playbook"
   brand_color: "#1677FF"
-  default_prompt: "Use $lingxing-ads-playbook to audit my Amazon ads for ASIN <ASIN> on US via Lingxing MCP and give a complete product-fit adjustment playbook."
+  default_prompt: "Use $lingxing-ads-playbook to audit my Amazon ads for ASIN <ASIN> on US via Lingxing MCP and Xiyou MCP (xydc-mcp), verify North-Star outcomes, and output the complete 13-section product-fit adjustment playbook and conflict-free bulk TSV."
 
 dependencies:
   tools:
     - type: "mcp"
       value: "lingxing-mcp"
-      description: "Lingxing OpenMCP for Amazon ads, listing, and FBA reports"
+      description: "Lingxing OpenMCP for Amazon ads, placement reports, listing, financial profit, and FBA reports"
       transport: "streamable_http"
       url: "https://openmcp.lingxing.com/mcp-servers/lingxing-mcp"
+    - type: "mcp"
+      value: "xydc-mcp"
+      description: "Xiyou Data Insights MCP for organic/sponsored keyword ranks, ASIN & competitor traffic structure, parent 4-channel split, keyword count & BSR trends, and daily deal/price trends"
+      transport: "streamable_http"
 
 policy:
   allow_implicit_invocation: true

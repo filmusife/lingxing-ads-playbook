@@ -1,6 +1,6 @@
 ---
 name: lingxing-ads-playbook
-description: 用领星 MCP 按 ASIN+站点拉取最近30天真实广告与 Listing 数据，按产品匹配做深度 SP/SBV 分析，并输出可执行的完整广告调整手册。在用户给 ASIN 和国家/站点、提到领星广告、广告组合、SP 广告优化、搜索词否定、基础竞价、位置溢价、或输入 /lingxing-ads、/广告调整 时使用。不要用于写 Listing 文案、品类选品、或没有活数据的空泛广告理论。
+description: 用领星 MCP (LingXing-MCP) 与西柚洞察 MCP (xydc-mcp) 按 ASIN+站点拉取30d/7d/3d真实广告、三展位、财务毛利、自然/广告双轨排名及竞品流量护城河活数据，按产品匹配与北极星预期闭环做深度 SP/SBV 分析，并输出完整13节（## 0~## 12）广告调整手册与零冲突批量表。在用户给 ASIN 和国家/站点、提到领星广告、广告组合、SP 广告优化、搜索词否定、基础竞价、位置溢价、或输入 /lingxing-ads、/广告调整 时使用。不要用于写 Listing 文案、品类选品、或没有活数据的空泛广告理论。
 metadata:
   short-description: Deep Lingxing ads audit and full adjustment playbook
 ---
@@ -87,7 +87,7 @@ metadata:
 22. **本地持久化数据库台账与跨会话自动效果归因体系 (Persistent Local DB Ledger & Cross-Session Effect Attribution)。**
     - **彻底告别聊天窗口记忆依赖**：大模型对话窗口是瞬态终端，不可作为业务记忆数据库。系统在工作区根目录下统一维护 `db/` 本地数据库（包含 `db/daily_records/` 每日档案、`db/ledger/` 历史调优台账、`db/snapshots/` 状态快照）。
     - **每日自动归档截面**：分析脚本运行后，自动在 `db/daily_records/{KEY}_{YYYYMMDD}.json` 中存入当日全域数据截面（包含店铺、ASIN、大盘流量、各活动当日与切片指标）。
-    - **持久化调控台账**：系统在 `db/ledger/{KEY}_ledger.json` 与 `.tsv` 中永久追加记录每一笔调整事件（活动名、调整对象、改前值 $\to$ 改后值、发生时的基线 CPC/曝光/ACOS）。
+    - **持久化调控台账**：系统在 `db/ledger/{KEY}_ledger.json` 与 `.tsv` 中永久追加记录每一笔调整事件（活动名、调整对象、改前值 → 改后值、发生时的基线 CPC/曝光/ACOS）。
     - **实体级高精对账归因 (Entity-Level Precision Ledger)**：调优台账深度穿透至具体实体层级（记录 `entity_id`、`target_name`、`entity_type`、改前该实体的 3d/7d/30d CPC 与曝光切片基线）。跨会话对账时，精准对比该关键词或投放项本身的 $\Delta \text{CPC}\%$ 与 $\Delta \text{Imp}\%$，彻底剔除全活动其他词条带来的统计稀释与假性断流误判！
     - **跨会话自动归因对账**：在新开任何会话窗口体检时，脚本自动读取该台账，并将调前基线与今日最新 3 天/7 天切片指标进行对账，自动算出 $\Delta \text{CPC}\%$、$\Delta \text{Imp}\%$ 与调后状态（`【调后生效·见效保持】` / `【断流休克熔断】` / `【失血暴冲熔断】` / `【动态观察期】`）。
     - **报告强制第 2 节对账**：交付的体检手册第 2 节必须完整展示《历史调控台账与调后效果复盘对账总表》，彻底打通跨窗口的历史记忆断层！
@@ -102,6 +102,10 @@ metadata:
       1. **零曝光止血判定**：若 `imp_3d == 0` 且 `spend_3d == 0`（或 `imp_7d == 0` 且 `spend_7d == 0`），说明前期降价已成功切断流量，当前损耗已归零（止血已经完成）！**绝对禁止再次建议下调基础竞价**！此词处于【调后已零曝光·维持观察期】，维持当前竞价观察，严禁二次打压导致彻底丧失权重。
       2. **活跃流血必要前提**：下调基础竞价的必要前提是【当前仍在活跃持续流血】，即必须满足近 3 天仍有活跃花费（`spend_3d >= $1.50`）或近 7 天无单损耗（`spend_7d >= $3.00`）。若最近 3 天花费为 $0.00，绝对不允许仅因 30 天累计历史均值难看就建议再降价！
       3. **基础竞价地板保护**：基础竞价低于或等于 $0.25 时，不可继续砍价 25%，防守保底出价，避免彻底窒息跌入亚马逊底层拍卖冷宫。
+      4. **近期真实出单与有产出词保护铁律（严禁混淆搜索词切片与投放词，严禁将有单误判为0单流血）**：
+         - 必须严格区分【买家搜索词切片 (Customer Search Term)】与【投放词实体 (Targeted Keyword)】的数据边界！广泛投放词下单个搜索词 0 单绝不等于投放词 0 单；
+         - 提取投放词近 3 天表现时，必须完整拉取 `ord_3d`、`spend_3d`、`sales_3d`、`acos_3d`。若投放词在近 3 天已有真实出单（`ord_3d > 0`），其属性绝对属于【近期有产出】而非【0单流血】！
+         - 若投产超标（ACOS > 目标 ACOS），必须依据投放词真实成交出单与转化率（`cvr_30d`）科学倒推保本竞价，并在调整理由与报告各处如实呈现近 3 天真实出单量（如`近3天出单 2 单，花费 $19.86，ACOS 38.6%`），严禁将有单词谎报为“近3天花费 $19.86 且 0 单”，严禁误导模型将有产出词打为恶意流血词。
 25. **大盘搜索飞轮与流量漏斗健康度底线 (Top-of-Funnel Discovery Health & Flywheel Principle)。** 广告优化的终极目的绝不是“通过把流量全砍死来换取短期 ACOS 变低”，而是“压制无效流血的同时，维持大盘健康销售速度（Sales Velocity）与自然位增长”。真实数据复盘揭示（如成熟飞轮产品月销近 $100k、毛利飙升 28%、自然转化率提升 13% 的成功经验 vs 脆弱型产品流量过度砍伐导致总销售滑坡的教训）：全组合必须保持“漏斗平衡”——精准仓出单占比健康区间为 40%~60%，自动与广泛仓必须维持至少 30%~40% 的有效流量供给。若全组合曝光总量断崖暴跌超过 50% 且大盘净销售额连续下滑，判定为**【大盘失速断流】**，严禁继续无差别砍词砍预算，必须立即对自动仓/核心广泛仓进行适度补价回踩（+10%~+15%），拉回大盘流量基本盘！
 26. **碎片化单词活动收敛协议 (Fragmented Campaign Sunsetting & Merging SOP)。** 对于历史上为了单组单曝光而开设的大量单一关键词独立活动（如单个活动仅投放 1 个词且日曝光跌破 50 次，或历史负分累积严重）：严禁无休止进行无效微调出价，避免陷入“降价就死锁断流、提价又失血暴冲”的僵局。必须执行**收敛合并**：将验证能出单的词条按历史成交 CPC 倒推基准竞价，直接录入核心精准大仓（如 `*-exact-prove`），随后彻底归档老活动，将预算与权重向核心主仓高效聚合！
 27. **Listing 流量底盘承接力与自然位缓冲厚度分级 (Listing Organic Readiness Index)。** 真实多期数据证明，不同商品由于自然流量基础与页面评价壁垒不同，对广告调价承受力存在天壤之别：
@@ -182,6 +186,157 @@ metadata:
     - **休克断流的广告位前置核验**：当任何关键词或活动近 3 天日均曝光跌幅超过 70% 时，系统必须优先穿透 `xydc_ranks.json`（西柚洞察广告排名 `sp_rank` 与自然排名 `organic_rank`）以及活动顶部展示份额（`tos_share`）：
       1. **首屏黄金位保护 (`TOP_POSITION_MARKET_COOLDOWN`)**：若该词广告位高居全网首屏顶部（`sp_rank <= 3` 或首屏前列且 `tos_share >= 50%`），曝光回落 100% 属于大盘搜索需求波动、节后降温或秒杀结束，出价并未脱靶！**代码底层强行锁定：禁止触发 `CIRCUIT_BREAKER_SHOCK`，禁止输出 `Probe_Bid_Recovery`，统一输出 `Top_Rank_Cooldown_Hold` 维持基准竞价稳态运行**！
       2. **SP #1 顶展防内耗限价**：在双轨协同（Rule 38）中，凡关键词广告排名已达 SP #1（顶展第一），严禁继续追加竞价溢价，严防无意义拉高单次点击成本（CPC）引发严重流血。
+49. **位置溢价下调的基础竞价科学托底补偿闭环铁律 (Compensated Base Bid Floor on TOS Reductions)。**
+    - **休克本质解剖**：严禁在大幅砍掉虚高 TOS（如 250% -> 60%）时，任由基础竞价保持在原极低水平（如 `$0.28~$0.30`）！真实数据证明，砍 TOS 后若基础竞价不补偿托底，顶展有效竞价直接腰斩（-54%），瞬间跌破类目底层拍卖门槛，导致 95 个活动曝光断崖暴跌（-70%~-99%）陷入休克死锁。
+    - **强制补偿机制**：凡下调活动 TOS，系统必须依据基线 CPC 自动计算托底基础竞价：$$\text{Compensated Base Bid} = \max\left(\text{Current Bid}, \text{round}\left(\frac{\text{Baseline CPC}}{1 + \frac{\text{New TOS}}{100}}, 2\right)\right)$$
+      若当前竞价低于该值，代码底层强制生成 `Compensated_Base_Bid_Floor` 指令托底，确保有效出价平稳咬合类目出单成本，彻底终结“砍 TOS 就休克”的系统性断流。
+50. **脆弱品与高退款品增量毛利与单量底盘硬刹车铁律 (Incremental Gross Margin & Sales Floor Guardrail for Fragile Listings)。**
+    - **单位经济本质认知**：对高退款率（`refund_rate >= 12%`）或脆弱纯广告依赖型（`ORGANIC_FRAGILE`）单品，单位经济模型已被退款运费损耗侵蚀。真实数据证明：粗暴降预算砍竞价虽然省下了数百美元广告费，但全店总销售额与单量断崖跌 12%~25%，导致净利润恶化（亏损扩大）。
+    - **销售底盘硬刹车触发标准**：若近期总单量环比下跌超 12% 或毛利亏损恶化，系统自动触发 `[CRITICAL_SALES_FLOOR_BRAKE]`，强行锁定核心转化仓位的基础竞价，停止泛降价与粗暴砍量，将所有预算收敛至退款率低、具有特定卖点的精准词与赢家 ASIN，并强制启动供应链与 Listing 预期管理专项排查。
+51. **ERP 跨店铺比率单位畸变防爆与财务真理对账铁律 (ERP Unit & Currency Normalization with Authoritative Financial Ground Truth)。**
+    - **比率格式与币种陷阱认知**：领星 API 的 `product_performance` 接口存在不同店铺字段格式不一致风险（某些店铺如 Quafe 中 `acoas` 与 `adv_rate` 返回已成百分比的 2.6280 和 11.7368，直接乘 100 会虚增 100 倍至 262.8% 和 1173.68%，将极健康的成熟品误判为极端脆弱品）；此外该接口货币单位为人民币 CNY。
+    - **规范对账动作**：TACOS 与广告销售占比必须以领星财务订单接口 (`financial_profile.json`) 中美元金额的真实总广告费与总销售额为唯一基准（`True TACOS = ad_cost / sales * 100`），禁止无条件信任原始比率字段乘 100，建立防爆跨验。
+52. **调控台账实体类型与回踩探底安全隔离铁律 (Ledger Entity-Type Isolation & Sanity Ceiling for Probe Bid)。**
+    - **数据污染根源解剖**：历史台账包含 `bid`, `tos`, `pp`, `ros`, `budget` 等多类实体。严禁将位置溢价（TOS 60%、PP 100%、ROS 250%）的数值误作为竞价传入回踩探底公式，避免生成 `$69.00`、`$115.00`、`$310.50` 等荒谬竞价！
+    - **隔离与限价规范动作**：代码底层严格隔离 `entity_field`。位置溢价休克仅建议溢价回调或广告组托底；投放词竞价回踩必须设置安全上限（$\le \min(\$2.50, \text{Baseline CPC} \times 1.8)$），杜绝任何失控出价。
+53. **领星多层级分时调价穿透、基准值联动与 CPC 去偏评估铁律 (Multi-Level Dayparting Penetration, Base-Value Co-Regulation & Intra-Day De-Biased CPC Evaluation Rule)。**
+    - **多层级分时实体穿透与识别 (Multi-Level Dayparting Extraction)**：
+      - 领星分时调价不仅可在活动层级（Campaign Level）配置，更普遍支持在**关键词层级 (Keyword Level)** 与 **商品投放层级 (Target / ASIN Level)** 独立绑定策略！
+      - 系统必须同时穿透 `keywords.json` 与 `targets.json` 提取 `is_apply_time`、`timing_base_value` 与 `applied_templates`。若实体绑定了分时模板，交付的手册、TSV 表格与建议中必须显式标明 `[领星分时策略运行中: 模板'{template_name}', 当前分时基准值:${timing_base_value}]`，并在 Section 1.3、Section 4 与 Section 5 详实呈现分时落地全貌，严禁在后台已应用分时的情况下视而不见或误判为普通静态出价！
+    - **分时基准竞价 (timing_base_value) 联动生效机制**：
+      - 在领星 ERP 机制中，凡标记为 `is_apply_time == True` 的关键词或投放项，若仅在亚马逊后台修改基础竞价，会在下一个整点被领星的分时调度定时任务依原基准值自动覆盖！
+      - 因此，凡对分时实体提出基础竞价调整建议时，必须明确告知运营：**同步更新领星 ERP 后台的分时基准竞价 (`timing_base_value`) 为建议值**，确保分时调度器基于全新基准值进行上下浮动！
+    - **加权均值去偏认知（打破日均 CPC 均值陷阱）**：
+      - 在一天的一定时间内加了溢价（如高峰期 +15%~+25%，低谷期 -20%~-30%）后，买家点击会自然高度加权集中在高峰期，导致全天的加权综合日均 CPC（Blended CPC）相较于历史均值自然产生 +10%~+35% 的合理上浮。**严禁仅凭单日综合 CPC 上浮就误诊为“失血暴冲 (CIRCUIT_BREAKER_BLEED)”而建议下调基础竞价！**
+    - **良性溢价容差豁免带**：
+      - 对标记为 `is_apply_time == True` 的实体，系统自动注入分时容差豁免：若 $\Delta \text{CPC} \le +30\%$ 且 ACOS 受控、转化单量健康（如 3 天累计出单稳健），判定为 `【领星分时调价生效·良性溢价稳态】`，严禁触发降竞价建议。
+    - **低基准值锁定与断流规避 (Low-Base Value Lockout Guardrail)**：
+      - 当关键词的基础竞价本身偏低时（如 `$0.35~$0.43`），在分时策略的低谷期按比例扣减（如 `-20%~-30%`）后，实时竞价会瞬间跌入 `$0.25~$0.30` 以下，彻底跌穿亚马逊底层类目拍卖可见度门槛，导致全天曝光断崖暴跌（如 `spice grinder` 从日均 3575 跌至 320，暴跌 -91.1%）！
+      - 遇到此类实体，建议动作绝不是继续砍价，而是**适度上调分时基准竞价至安全托底线（如 `$0.50~$0.55`）**，或将低谷期下浮比例收窄，避免在非高峰时段发生拍卖闭门羹！
+    - **策略建议双轨分流（基准值调整 vs 时段浮动比例微调）**：
+      - 必须明确区分两种操作场景并在手册中清晰指引：
+        1. **基准值调整**：若全天各时段整体 CPC 偏离目标或转化率发生系统性跃迁 → 建议调整**分时基准竞价 (`timing_base_value`)**；
+        2. **时段浮动比例微调**：若仅在特定边缘时段（如凌晨 01:00-05:00）发生无转化点击流血，而高峰期表现优异 → 建议保持基准竞价，仅微调**分时模板中该时段的浮动百分比**（如将 -15% 加大为 -30%）。
+54. **意图与状态闭环修复——彻底终结“暂停/否定实体误判休克断流”的死循环 (Intentional State & Negative Transition De-biasing Rule)。**
+    - **核心痛点与数据实证**：在历史调优对账中，当活动/广告组/关键词/商品投放被运营或系统主动设置为 `state == "paused"`（例如 `B00004S9CY`、`B0G2RHVLSH`、`flax seed grinder`），或添加了精准否定词时，其曝光在调后自然断崖跌 `-70%~-100%`。旧版逻辑未做前置状态意图过滤，直接触发 `CIRCUIT_BREAKER_SHOCK`，输出“立即科学倒推回踩探底至 $0.67 激活展示池”，引发“暂停 -> 误判断流 -> 提价复活 -> 亏损再次暂停”的恶性死循环！
+    - **铁律规范**：历史对账与动态熔断审计必须前置核验实体的意图类型：凡实体 `field == "state"` 且 `new_val == "paused"`，或当前后台处于 `paused`，统一判定为 `【合规意向暂停·阻断流血】`；凡调整属于 `Negative_Exact` / `Negative_Phrase`，统一判定为 `【否定拦截生效·预期归零】` (`INTENTIONAL_STOP_BLEED`)。代码底层强制锁定：绝对禁止触发休克熔断，绝对禁止输出 `Probe_Bid_Recovery`（回踩探底），坚决维持停运与否定状态。
+55. **动态保本竞价锚定与柔性渐进阶梯调控铁律 (Dynamic Break-Even Bid Anchoring & Soft-Tier Step Down Rule)。**
+    - **核心痛点与数据实证**：数据统计显示，在 174 次下调基础竞价操作中，多达 141 次（81.0%）引发了曝光断崖跌 >= 70% 的断流休克！一刀切的 `-25%` 暴力砍价直接打穿了亚马逊底层拍卖竞价门槛，导致关键词跌出搜索首屏与次屏，流量瞬间冰封。
+    - **铁律规范**：严禁对所有高耗词一刀切降价 25%！
+      1. **有单词动态保本锚定**：对历史有出单（`orders >= 1`，有基准 CVR）的词条，建议基础竞价必须严格基于客单价、目标 ACOS、实际转化率与当前 TOS 倒推：
+         $$\text{Target Base Bid} = \max\left(\text{Bid Floor},\ \text{round}\left(\frac{\text{Target ACOS} \times \text{Avg Price} \times \text{CVR}}{1 + \frac{\text{TOS}}{100}}, 2\right)\right)$$
+         单次降幅严格限制在 `-10% ~ -20%` 之间，精准咬合盈亏平衡点，坚决杜绝超砍断流；
+      2. **无单词两阶柔性渐降**：
+         - 中度流血（近3天花费 `< $10.0` 或总花费 `< 1.5` 倍客单价）：首期柔性微降 `-15%`，给算法重新咬合展示池留出缓冲；
+         - 重度流血（近3天花费 `>=$10.0` 或总花费 `> 1.5` 倍客单价）：降价 `-20%`；
+      3. **硬性底价保护**：普通 Listing 底价保底 `$0.25`，脆弱依赖型（`ORGANIC_FRAGILE`）或高退款率（`refund_rate >= 12%`）单品底价绝对硬保底 `$0.30`，严禁任何建议将基础竞价击穿至 `$0.22`。
+56. **负向词根排查与多维广告位指纹优先级铁律 (Bleeding N-Gram Exclusion Priority over Placement Diagnosis)。**
+    - **核心痛点与数据实证**：实战案例教训：西班牙语长尾词 `moledor de cafe de grano` 累积 82 点击、花费 `$70.14`、**0 订单**，已命中流血词根 `grano`（累积流血 $70.86）。然而在旧版广告位指纹诊断中，因其 CTR 偏低（0.45%），被程序错误归类为“受抑核心词 (`TRAPPED_CORE_HERO`)”，并在批量表中推荐 `Elevate_To_TOS` 加价 15% 提权至 `$0.94`！与报告正文的词根否定建议直接严重自相矛盾！
+    - **铁律规范**：广告位提权救赎（`Elevate_To_TOS` / `TRAPPED_CORE_HERO`）享有严格准入条件：
+      1. **负向词根最高前置否决权**：凡命中已识别流血词根（Bleeding N-Grams）或物理冲突（IS NOT）的搜索词，一票否决，绝对禁止标记为 `TRAPPED_CORE_HERO`，严禁提权加价；
+      2. **大样本高耗未转化硬刹车**：凡搜索词已累积 `clicks >= 25` 或 `spend >= $20.0` 且 `orders == 0`，大样本已充分证实该流量在本品无法有效转化，强制判定为 `FAILED_EXTENDED_TEST`，自动执行降竞价防守或精准否定，严禁盲目加价提权！
+57. **碎片化单活动自动收敛合并协议 (Automated Fragmented Campaign Sunsetting & Merging Protocol)。**
+    - **核心痛点与数据实证**：在多款单品（如 `US-CG618B-D`、`US-OK2075B`）中，存在大量历史上为单个单词设立的孤岛活动（如 `coffee grinder electric`、`spice grinder electric` 等 7 个活动），各占用 $15-$50/天日预算，总计冻结超 $200/天预算，且 30 天出单仅 0-2 单，导致预算碎片化与严重的内部自我竞蚀。
+    - **铁律规范**：系统在输出批量调整表（`bulk_adjustments.tsv`）时，自动扫描并识别孤岛活动：凡投放词数 $\le 2$ 个、30 天出单 $\le 2$ 单且花费 $\le \$35.0$ 的启用活动：
+      1. 若有出单词，自动输出 `Converge_Harvest_To_Exact` 指令，将词条按历史成交 CPC 倒推基准竞价迁移至核心精准主仓（`*-exact-prove`）；
+      2. 自动输出 `Archive_Fragmented_Campaign` 归档指令，彻底归档老活动，释放被锁定的日预算，将权重与预算聚合至主仓。
+58. **移词精准收割 3-5 天软交接与气密性防护铁律 (Keyword Harvest 3-Day Soft Handoff & Hermeticity Rule)。**
+    - **核心痛点与数据实证**：移词收割（`Harvest_To_Exact`）若在精准仓开启的当日就在广泛仓执行精准否定，会导致在精准仓尚未跑通拍卖门槛的 3-5 天冷启动期内，全账户流量瞬间断流，出现严重“流量空窗期”。
+    - **铁律规范**：移词收割实行两阶段软交接：
+      - **第 1 阶段（精准仓启动）**：精准仓以科学倒推竞价（`Base Bid = 历史出单 CPC / (1 + TOS%)`）开启投放，原广泛仓**暂不执行否定**，保持 3-5 天软交接观察期；
+      - **第 2 阶段（稳态后交接否定）**：仅当精准仓在后台跑出第一笔成交且日曝光稳定后，再在广泛仓执行精准否定，杜绝大盘流量断流。
+59. **全场景比率单位畸变与跨店铺财务防爆铁律 (Comprehensive Multi-Shop Ratio Normalization & Financial Alignment Rule)。**
+    - **核心痛点与数据实证**：领星 ERP API 在不同店铺（如 Quafe）中返回的 `adv_rate` 与 `acoas` 格式不一（如 11.7368 代表 11.74%，而非小数 0.1174），若机械乘 100 会虚增为 `1173.68%`，导致一个真实 TACOS 仅 2.63% 的健康成熟飞轮产品被错误评级为 `ORGANIC_FRAGILE`，进而实施错误的过度紧缩调控！
+    - **铁律规范**：系统强制以领星真实财务订单接口（`financial_profile.json`）中的美元金额为唯一真理基准：
+      - 无论 API 原始比率如何返回，系统自动比对 `raw_adv_rate` 与真实广告销售占比；若原始值大于 1.0 且接近真实百分比，则识别为已带百分比格式；
+      - 强制设定物理上限：广告销售占比与 TACOS 上限绝对受控在合理范围内，严禁出现 1000%+ 异常数值污染评级系统。
+60. **ASIN 商品投放独立出价矩阵与防休克底价铁律 (Dedicated Product Targeting Bid Floor & Elasticity Rule)。**
+    - **核心痛点与数据实证**：在全盘 1,099 笔调控事件对账中，多达 65 笔（63.7% 的休克案例）发生在 ASIN 商品投放 (`target_bid`) 上！商品详情页 (PP) 广告位极少，有效拍卖底价门槛（通常 `$0.38~$0.55`）显著高于搜索长尾位。将竞品 ASIN 砍至 `$0.20~$0.25` 直接导致曝光暴跌 80%~99% 甚至完全归零。
+    - **铁律规范**：彻底解耦关键词竞价与 ASIN 投放竞价：
+      1. **ASIN 投放专属独立底价**：普通 Listing 的 ASIN 投放硬底价不得低于 **`$0.36`**；脆弱型或高退款 Listing 的 ASIN 投放硬底价不得低于 **`$0.42`**；
+      2. **柔性降价阶梯与溢价穿透倒推**：对高耗微亏的竞品 ASIN，调价基准必须是**当前基础竞价 (cur_base)** 或**剔除活动商品页溢价 (PP) 后的真实有效扣费**：
+         - 阶梯下调基准公式：`suggested_bid = max(target_floor, min(round(cur_base * 0.88, 2), round((cpc * 0.85) / (1 + PP/100), 2)))`；
+         - 严禁直接拿包含了商品页溢价的实际点击扣费 CPC 乘以系数后直接作为建议基础竞价（会导致基础竞价不降反升，出现“基础出价0.44却建议降价到0.48”的荒谬现象）；
+         - 严格保证 `suggested_bid < cur_base`（单调性收敛），降幅百分比动态计算并精准对应，当前出价已达底价时强制转为 `Keep_Monitoring` 并提示微调活动 PP 溢价。
+      3. **纯美元数值交付**：批量调整表中建议值必须输出纯美元绝对值（如 `$0.38`），严禁包含混合说明文本。
+61. **FBA 断货休眠与极低库存应急防御铁律 (FBA Stockout & Low-Inventory Emergency Protocol)。**
+    - **核心痛点与数据实证**：真实实战中（如 `UL-CG728` 销售暴跌 97.7%），Listing 因 FBA 可售库存归零（`fulfillable == 0`）失去购物车，导致广告被亚马逊强制暂停；旧版逻辑将其误诊为“出价脱靶导致的休克断流”并输出盲目回踩提价探底指令。
+    - **铁律规范**：广告诊断前强制优先核验 `fulfillable` 与 `days_of_supply`：
+      1. **断货休眠状态 (`STOCKOUT_SUSPENDED`)**：若 `fulfillable == 0`，判定为断货停推正常表现，彻底屏蔽所有休克断流判定与加价回踩探底指令，批量表中统一输出 `Stockout_Conserve_Hold` 维持出价稳态，告警运营静待补货入仓；
+      2. **极低库存告急 (`LOW_INVENTORY_THROTTLE`)**：若 `days_of_supply <= 7` 天，触发控流防断协议，下调泛流与自动仓预算 30%~50%，仅保留精准主粮词，平滑过渡至补货上架防断崖。
+62. **真实边际贡献 (Contribution Margin) 与高退款品类广告极限制 (Strict Refund & Unit-Economics Brake)。**
+    - **核心痛点与数据实证**：在真实单品中（如 `UL-BZ02` 退款率高达 21.74%，单月销售 \$9,000+ 却持续净亏损 -\$595~-\$938；`UL-CM1068` 单位毛利仅 \$9.05），单位经济模型被退款处理费吞噬，单靠广告调价无法盈利。
+    - **铁律规范**：当财务数据中 `refund_rate >= 15.0%` 时，强制启动【高退款极限制冷模式】：
+      1. **目标 ACOS 强制紧缩**：自动收缩目标 ACOS 上限 25%~35%，封顶广告花费；
+      2. **泛流强制截流**：在批量表中对所有自动仓与广泛仓执行 `High_Refund_Throttle_Budget` 削减预算 30% 止血；
+      3. **预算聚焦收敛**：广告预算 100% 收敛至客单转化意愿极强的细分特定功能精准词（`orders >= 2` 且投产优秀）；报告首页输出 Listing 宣传与产品说明书预期排查建议。
+63. **脆弱广告依赖型单品“流量置换”与大盘销售底盘守护铁律 (Fragile Traffic Replacement & Sales Floor Brake)。**
+    - **核心痛点与数据实证**：在脆弱型单品（如 `UL-KED0003`）上，广告花费被粗暴砍掉 44% 导致全店访客暴跌 32%、总销量跌 13%、毛利再损 27%。脆弱品缺乏自然承接力，砍广告等于掐断全店唯一步进流速。
+    - **铁律规范**：对标记为 `ORGANIC_FRAGILE` 的单品，代码底层强制推行【流量等量置换】：
+      1. **严禁纯砍流**：凡在调整中削减泛流词或下调出价，系统必须在同日等量提取并注入已验证出单的精准长尾词（`Proven Converters`）；
+      2. **底盘保护**：严格确保全店访客池 Sessions 跌幅受控在 $\le 5\%$ 以内，守卫大盘销售底盘；基础竞价保底绝对下限为 `$0.30`（ASIN 投放为 `$0.42`）。
+64. **跨界多用途高产卖点词 (Hero Engine) 自动化提权与收割铁律 (Cross-Category Multi-Purpose Hero Engine Rule)。**
+    - **核心痛点与数据实证**：实战数据证实，磨豆机兼作香料/种子研磨（`spice grinder`、`seed grinder`）的词条 CVR 高达 14%~22%、ACOS 仅 9%~15%，贡献了全店超 50% 的利润；而品类通用词 `coffee grinder` 投产微薄。
+    - **铁律规范**：
+      1. **跨界卖点词根引擎**：自动扫描 Listing 标题与卖点中的副功能属性（磨豆机的 spice/seed/herb，咖啡机的 cold brew/tea，搅拌机的 smoothie/protein，电水壶的 pour over/tea）；
+      2. **出单词最高豁免**：凡跨界词真实出单（`orders >= 1` 且 ACOS 受控），标记为 `MULTI_PURPOSE_PROVEN_HERO`，豁免所有品类通用规则打压；
+      3. **优先提权收割**：优先移入独立精准主题仓（如 `*-spice-exact`）独享预算放大，充分吃透高毛利跨界红利。
+65. **分时调价预算早竭防御与晚间黄金高峰优先调度铁律 (Dayparting Budget Pacing & Evening Prime Priority Rule)。**
+    - **核心痛点与数据实证**：数据表明，早晨 08:00-10:00 叠加 +20% 溢价会导致日预算在中午 13:00 前被打空，而晚间 16:00-20:00 才是全天订单量最密集、全店销售额爆发的晚间超级高峰窗口（单时段出单 531 单），导致晚间黄金期被动下线。
+    - **铁律规范**：动态比对活动日预算利用率：
+      1. **高预算利用率保护 (`utilization >= 80%`)**：早间（06:00-11:00）严禁盲目加高溢价，执行 `+0% ~ +5% Neutral Hold`（中立稳态续航）；
+      2. **晚间黄金高峰加码**：重点在晚间爆发期（16:00-21:00）配置 **`+15% ~ +20%`** 溢价抢占首屏，并在凌晨低效期执行 **`-25% ~ -30%`** 压价，将宝贵预算储备平移至晚间爆发期消耗。
+
+66. **北极星总览预期闭环对账与大盘缩量萎缩硬刹车铁律 (Macro North-Star Outcome Scorecard & Sales-Velocity Shrinkage Brake)。**
+    - **总览结果校准（防越调越偏）**：每次运行自动基于逐日美元产品表现序列 (`product_performance_daily.json`) 与本地预期库 (`db/expectations/{KEY}_expectations.json`) 生成 `macro_scorecard.tsv` / `macro_scorecard.json`，硬核对账近 7 天 vs 前 7 天及上期设定预期：全店真实日均总销售额、日均总单量、日均自然单量 (`nature_order_items`) 与自然单占比、真实全店 TACOS、访客 Sessions、购物车赢得率与小类 BSR。
+    - **缩量萎缩防线 (`VELOCITY_SHRINKAGE_ALERT`)**：当监测到广告花费被压缩的同时，全店日均总单量环比下跌 `>= 15%`（或跌破上期设定的刚性销售额红线地板），代码底层自动激活 `velocity_shrinkage_guard = True`：立即冻结对核心有转化活动的大幅砍 TOS 与降基础竞价操作，转向守住核心出单流量底盘并通过已验证出单词与西柚 Tier 5 自然盲区词补量，坚决阻断“ACOS 表面变好看、全店销量与自然飞轮却持续萎缩”的致命偏航！
+67. **外部非广告干扰源前置剥离与多店铺共享 ASIN 单店财务精准对齐铁律 (External Confounder Isolation & Multi-Store `sids` Financial Ground Truth)。**
+    - **六大非广告干扰源自动剥离**：在评判前期调优是否达标前，系统自动交叉扫描并剥离 6 类外部混杂变量——FBA 断货 (`CONF_STOCKOUT`)、极低库存 (`CONF_LOW_INVENTORY`)、购物车丢失 (`CONF_BUY_BOX_LOSS`, Buy Box `< 85%`)、近 7 天日常售价上调超 8% (`CONF_PRICE_HIKE`，源自西柚 `get_asin_info_trends`)、秒杀/大促结束自然回落 (`CONF_DEAL_COOLDOWN`)、以及近期 Listing 标题/五点/主图修改 (`CONF_LISTING_CONTENT_CHANGE`，源自领星 `sales_operate_log_list`)，严禁将外部经营异动误判为广告出价失误。
+    - **跨店铺财务单店精准对齐**：针对同一 ASIN 多店铺共卖场景，`load_financial_profile` 优先精确匹配单元素 `sids == [当前店铺 sid]` 的利润行（绝不误取 `[1075, 1132]` 跨店汇总行污染当前单店广告组合保本线），全量计入 `SP + SB + SBV + SD` 全渠道广告费与月度/长期仓储费 (`fba_storage_fee + long_term_storage_fee`)，完整保留负毛利率符号，并单独输出 `omni_shop_summary` 供第 `0.3` 节全局对照。
+68. **真实三广告位报表穿透保护与「动态竞价 - 提高和降低」2x 顶展放大审计铁律 (Real 3-Slot Placement Report Protection & `Up & Down` 2x Effective Bid Audit)。**
+    - **真实三展位数据驱动**：取数器自动调用 `get_sp_campaign_placement_report` 拉取 30 天与近 7 天各活动在 `搜索结果顶部 (TOS)`、`商品页面 (PP)`、`其余搜索位置 (ROS)` 的真实花费、直接/间接订单、CPC、CVR 与 ACOS（输出 `real_placement_performance.tsv`）。若某活动的 `PP` 或 `ROS` 展位真实出单 `>= 2` 单且 `ACOS <= 目标 ACOS × 1.15`，代码自动保护其有效溢价，严禁脱离真实展位产出机械清零！
+    - **竞价策略 2x 顶展天花板消雷**：在亚马逊底层拍卖中，`动态竞价 - 提高和降低 (autoForSales / Up & Down)` 会在位置溢价加成后再额外放大最高 **`2.0x`**（顶展位）或 **`1.5x`**（其余位），实际最高顶展扣费天花板高达 `基础竞价 × (1 + TOS%) × 2.0`！凡活动开启 `提高和降低` 且叠加高 TOS 导致 ACOS 超标失血，优先输出 `Update_Bidding_Strategy` 切换为 `动态竞价 - 仅降低 (Down Only)`，先拆掉双倍放大器再谈微调基础竞价。
+69. **西柚洞察 (`xydc-mcp`) 六接口全栈深度赋能、跨期双轨排名记忆 (`ΔOR`/`ΔSP`) 与自然盲区拓词铁律 (Full-Suite 6-Endpoint `xydc-mcp` Intelligence, Longitudinal Rank Memory & Tier 5 Blindspot Expansion)。**
+    - **六大接口必拉必用**：取数阶段通过 `scripts/xydc_client.py` 全量拉取西柚洞察 6 大核心接口并贯穿报告全文：
+      1. `get_asin_keywords` (`xydc_ranks.json` → `rank_synergy.tsv`)：精确计算本品在该词下的真实自然/广告流量构成占比（`organic_traffic / total_traffic × 100%` 与 `ad_traffic / total_traffic × 100%`，两者之和严格 `0~100%`，彻底区分类目获取率 `trafficAcquisitionRate`），提取 `OR`、`SP`、`SB` 真实 `totalRank` 与自然/广告增速；
+      2. `get_asin_traffic` (`xydc_traffic.json` → `xydc_competitor_benchmark.tsv`)：单次批量穿透本品 + Top 8 核心投放竞品 ASIN 近 7 天自然流量得分、广告流量得分、自然流量占比、收录词数与环比增速，在第 `0.2` 节与第 `1.9.1` 节量化敌我流量护城河；
+      3. `get_parent_asin_ad_overview`：穿透父体变体广告结构及 `Organic / SP / SB / SBV` 四渠道流量得分占比与头腰尾词分布；
+      4. `get_asin_keyword_count_trends`：追踪近 14 天每日自然收录词数、广告词数及 `OR / SP / SB / SBV / AC` 展位词数增减趋势；
+      5. `get_asin_bsr_trends`：追踪近 14 天大小类目 BSR 每日排名轨迹与 7d 环比进退；
+      6. `get_asin_info_trends`：追踪近 30 天每日挂牌价、秒杀价、Coupon、Prime 专享折轨迹（识别日常涨价与秒杀结束过渡期）。
+    - **跨期全量记忆与自然位滑坡保护锁 (`db/entity_memory/` & `entity_full_context.tsv`)**：每次调整任何词条，必须同时综合其历史 30d/7d/3d 广告表现、前次调整动作及跨期排名变化 `prev_org_rank → curr_org_rank (ΔOR)`、`prev_sp_rank → curr_sp_rank (ΔSP)`。凡历史有出单的核心词自然位处于前 20 名但近期下滑 `>= 4` 名（`ΔOR <= -4`），代码强制触发 **`Rank_Slide_Protection_Hold`（自然排名滑坡保护锁）**，拦截一切降竞价指令防止自然权重雪崩；并严禁冷却期内无极端异动的加减价左右横跳。
+    - **Tier 5 自然流量盲区自动化拓词 (`xydc_blindspot_opportunities.tsv`)**：自动筛选西柚洞察中已建立优质自然排位（`OR <= 45` 或高自然流量得分）、经 `IS / IS NOT` 校验属强相关核心词、但全组合尚无启用广告词覆盖的盲区好词，按目标精准仓 TOS 科学倒推起步基础竞价输出拓词清单。
+70. **两阶段移词闭环与实体级唯一胜出动作无冲突交付铁律 (Two-Stage Migration Closure & Deterministic Single-Winner TSV Arbitration)。**
+    - **移词收割不留半拉子工程**：除第 1 阶段倒推竞价软交接建词（自动跳过精准仓已启用词，若精准仓已存在但暂停则直接生成 `Unpause_Keyword` 杜绝重复建词）外，代码自动扫描已在精准仓稳定出单（`orders >= 1`）、但原广泛/自动仓仍未否定且继续低效耗血的词条，自动补齐第 2 阶段源仓 `Negative_Exact` 精准否定闭环。
+    - **单实体唯一胜出无冲突仲裁 (`resolve_entity_action_conflicts`)**：在写入 `bulk_adjustments.tsv` 前，对同一 `(campaign, target_entity)` 严格按安全优先级执行唯一胜出消解（例如 `Pause_Keyword` 物理冲突暂停一票否决同词跨仓 `Harvest_To_Exact` 与 `Lower_Bid`；已归档孤岛活动不再重复输出内部调价），100% 保证最终 TSV **零同实体冲突行、严格 7 列无制表符污染、纯绝对美元金额**，且与第 4 节总表、第 5 节活动详情完全一致。
+71. **API 0单 99999999.0% 极值清洗与 ROAS/直接间接单/顶展份额全量补齐铁律 (Zero-Order Sentinel ACOS Sanitization & ROAS / Direct-Indirect Orders / TOS Share Completeness Rule)。**
+    - **核心痛点与数据实证**：领星 API 在活动/关键词/商品投放 `spends > 0` 但 `orders == 0` 时返回 `acos = 99999999.0`，此前直接流入 `campaigns.tsv`、`keywords.tsv`、`targets.tsv`、`entity_full_context.tsv` 与历史台账 `baseline_acos`/`current_acos`，污染多期对账与报告可读性；同时 `keywords.tsv` 缺失 `direct_ord`、`indirect_ord`、`tos_share`、`roas`，`targets.tsv` 缺失 `7d/3d` 近期切片列。
+    - **铁律规范**：代码底层通过 `clean_api_acos` 统一将 0 单有花费行的数值 ACOS 规范化为 `999.0`（报告文本展示为 `-- (0单)`），并在历史台账加载时自动清洗遗留的 `>=999999` 极值；`campaigns.tsv` 补齐 `roas_30d/7d/3d`，`keywords.tsv` 补齐 `direct_ord`、`indirect_ord`、`tos_share`、`roas`，`targets.tsv` 补齐 `spend_7d`、`ord_7d`、`acos_7d`、`spend_3d`、`ord_3d`、`acos_3d`，实现长短周期与直接/间接转化因果闭环。
+72. **历史台账跨命名空间自动归并、覆盖动作归档与暂停活动假曝光清零铁律 (Cross-Namespace Ledger Unification, Superseded Action Archiving & Paused Campaign Exposure De-biasing Rule)。**
+    - **核心痛点与数据实证**：当同一广告组合先后以不带店铺前缀（`portfolio_{id}_ledger.json`）与带店铺前缀（`{shop}_portfolio_{id}_ledger.json`）运行时，历史台账发生断代；同一实体多次调价后旧版被覆盖记录仍永久滞留于 `IN_OBSERVATION` 或 `CIRCUIT_BREAKER_SHOCK`；且活动暂停或近 3 天 `0` 曝光但 `days_elapsed >= 3` 时，`curr_imp` 错误回退至 `daily_imp_30d` 导致假曝光与 `-100%` 假降 CPC 误判 `【调后生效·见效保持】`。
+    - **铁律规范**：
+      1. `load_and_sync_ledger` 自动扫描并去重合并同目录全部 `*portfolio_{id}_ledger.json` 历史台账，确保继承率 100%；
+      2. 同一 `(campaign, norm_entity, field)` 存在后续新调优记录时，旧记录自动归档为 `【历史动作已由后续调优覆盖·归档】(SUPERSEDED_ARCHIVED, days_remaining = 0)`；超 14 天未复现的陈旧休克记录自动归档为 `【超期历史断流记录·归档】`；
+      3. 活动已暂停或调后满 3 天且近 3 天 0 曝光时，`curr_imp` 严格置 `0.0`，且 `curr_cpc <= 0` 时 `delta_cpc = 0.0`，严禁将断流零点击误判为降本见效；
+      4. `locked_campaigns` 与 `observation_status.tsv` 严格与台账对账后仍在冷却观察期的记录同步。
+73. **北极星对账半日残缺剔除、前7天大促基线去偏与量效双降缩量防线铁律 (Incomplete Fetch-Day Exclusion, Prior-7d Deal Baseline De-biasing & Volume-Efficiency Drift Guard)。**
+    - **核心痛点与数据实证**：`product_performance_daily.json` 若包含拉取当日尚未结束的半天数据或 `sec_kill_records` 跨期大促落在 `prior_7d (T-14~T-8)`，会导致近 7 天环比被大促脉冲基线虚假拉低（如 `US-CG215` 前 7 天含 10-28 秒杀导致日均销额环比失真 `-31.6%`）；同时部分单品日均销额跌 `-11.9%` 但单量跌幅未达 `-15%` 且 TACOS 恶化时，此前误判为 `NEUTRAL_STABLE`。
+    - **铁律规范**：
+      1. 北极星对账自动剔除 `date >= today` 的未完结当日残缺切片；
+      2. `probe_deal_and_promotions` 与 `load_deal_info` 全量展开领星 `sec_kill_records` 促销起止区间，凡 `prior_7d` 命中大促日，自动追加 `DEAL_POST_COOLDOWN` 混杂因子并豁免虚假缩量告警；
+      3. 新增 `VOLUME_AND_EFFICIENCY_DRIFT`（量效双降预警）：当非大促回落期日均销额下跌 `<= -10%` 且 TACOS 上升（或自然单跌幅 `<= -25%`）时，同样激活 `velocity_shrinkage_guard = True`，冻结核心转化仓激进砍价。
+74. **财务仓储费全口径穿透、COGS 币种畸变防爆与自然单负值修正铁律 (Full Storage Fee Penetration, COGS Anomaly Guard & Negative Organic Order Clamping Rule)。**
+    - **核心痛点与数据实证**：领星 `milan_ profit_statistics` 将仓储费存放于顶层 `total_stock_fee`（及 `shared_fba_storage_fee`），旧版仅读 `fba_storage_fee` 导致仓储费恒为 `$0.00`；部分新品 ERP 采购成本误填人民币或整箱价（如单均 COGS `$219.44` vs 售价 `$19.99`）导致保本 ACOS 算出 `-1147.8%`、目标 TACOS 算出 `-895.3%`；且广告归因跨期超总单量时 `nature_order_items` 出现 `-204` 单负值，低基数新品（30天 14 单）因百分比虚高被误判为 `ORGANIC_FLYWHEEL`。
+    - **铁律规范**：
+      1. 仓储费穿透读取 `abs(total_stock_fee)` 与分摊仓储费，真实还原月度/长期仓储成本；
+      2. 当 `cogs_per_unit > avg_price * 1.05` 时自动标记 `cogs_anomaly_warning = True`，安全回退保本 ACOS 至 `30.0%`、目标 TACOS 保底 `>= 8.0%`；
+      3. `nature_order_items < 0` 时优先用 `order_items - ad_direct_order_quantity` 还原并执行 `max(0, ...)` 非负截断；`ORGANIC_FLYWHEEL` 必须同时满足 `30天自然单 >= 45 单且总访客 >= 1500`，防止微基数新品误判。
+75. **观察期冷却锁双向防连加（含 ASIN 投放）与脆弱品出单支柱词限幅降价铁律 (Bidirectional Cooldown Lock for Keywords/ASIN Targets & Fragile Converting Pillar Bid-Cut Cap Rule)。**
+    - **核心痛点与数据实证**：历史复盘发现，部分竞品 ASIN（如 `B00CT9XZMA`）在 7 天冷却期内被连续 4 次叠加推荐 `Harvest_ASIN / Elevate_To_TOS`（`$0.61 -> $0.70 -> $0.81 -> $0.90`），原因是台账键 `asin="b00ct9xzma"` 未与纯 ASIN 匹配且冷却锁仅拦截同向連砍未拦截同向连加；同时脆弱品（`ORGANIC_FRAGILE`）核心出单大词（如 `coffee grinder` 30天 8 单）被单次砍价 `-19%` 低于成交 CPC 的 75% 后引发流量休克。
+    - **铁律规范**：
+      1. 台账与 `entity_memory` 索引自动提取正则 `b0[0-9a-z]{8}` 双向绑定纯 ASIN 与表达式，并在 `entity_full_context.tsv` 中完整纳入 `target` 实体；
+      2. 7 天观察冷却期内，凡已执行过提价（`UPWARD_BID_ACTIONS` 或台账 `new_val > old_val`）的关键词与 ASIN 投放，自动锁定观察，严禁在冷却期内重复叠加提价指令；
+      3. 对 `ORGANIC_FRAGILE` 脆弱品上 `30d orders >= 6`（或 `7d orders >= 2`）的核心出单支柱词，若需温和控价，单次降幅硬封顶 `<= 10%` 且调后有效顶展竞价不得低于近期成交 CPC 的 `85%`，严防主粮词失速。
 
 ## 必做流程
 
@@ -250,9 +405,13 @@ metadata:
   - `observation_status.tsv`：**自变量变动差分与 AI 动态观察期状态（跟踪改动天数、正常公差稳态 NORMAL vs 熔断纠偏 CIRCUIT_BREAKER）**
   - `active_negatives_audit.tsv` & `unnegative_recommendations.tsv`：**全账户移词漏斗与已生效否定词体检（区分正常移词防内耗、移词后断流误杀、全账户孤儿词与物理冲突）**
   - `search_term_placement_diagnosis.tsv`：**多维广告位指纹诊断总表（含 CTR/CPC 指纹、推断广告位、策略标签与提权/降价/否定决策）**
-  - `rank_synergy.tsv`：**西柚洞察（xydc-mcp）自然排名 vs 广告排名双轨协同矩阵（自然排名、广告排名、自然流量占比、广告流量占比、五阶协同战术矩阵与控价决策）**
-  - `bulk_adjustments.tsv`：**可直接落地批量操作清单（含广告位提权拯救、顶部降竞价防守、移词断流精准重启、竞品对标降竞价/否定指令、分时调价调度，支持熔断紧急纠偏指令，过滤正常公差期活动）**
-- **最终手册必须按模板手写完整建议**，不要把 tsv 当最终交付物。第 2 节必须完整输出《历史调控台账与调后效果复盘对账总表》。
+  - `macro_scorecard.tsv` & `macro_scorecard.json` & `db/expectations/`：**北极星总览预期闭环对账卡（近7天 vs 前7天 vs 上期预期日均销售额、总单量、自然单占比、真实全店 TACOS、外部干扰剥离与缩量保护开关）**
+  - `real_placement_performance.tsv`：**领星真实三广告位表现表（各活动 30d/7d 在首页顶部 TOS / 商品页 PP / 其余搜索位 ROS 的真实花费占比、直接/间接订单与 ACOS）**
+  - `entity_full_context.tsv` & `db/entity_memory/`：**实体级全量上下文记忆表（融合 30d/7d/3d 表现、ABA 排名、跨期西柚自然位 `ΔOR` / 广告位 `ΔSP` 轨迹、前次调优动作与本期建议）**
+  - `rank_synergy.tsv`：**西柚洞察（xydc-mcp）自然排名 vs 广告排名双轨协同五阶矩阵（自然排名、广告排名、跨期 `ΔOR`/`ΔSP`、0~100% 本品自然/广告真实流量占比、类目获取率、增速与五阶控价决策）**
+  - `xydc_traffic_overview.json` & `xydc_competitor_benchmark.tsv` & `xydc_blindspot_opportunities.tsv`：**西柚洞察全域流量结构（本品+Top 8 竞品 7d 自然/广告流量护城河对比、父体四渠道流量占比、14d 收录词与 BSR 趋势、Tier 5 自然盲区高潜拓词清单）**
+  - `bulk_adjustments.tsv`：**经 `resolve_entity_action_conflicts` 唯一胜出仲裁的零冲突可直接批量导入清单（严格 7 列纯美元数值，含竞价策略 2x 消雷、真实展位保护、自然位滑坡保护锁、两阶段移词闭环、熔断紧急纠偏指令，过滤正常公差期与已暂停实体）**
+- **最终手册必须严格按 `references/report-template.md` 完整交付 `## 0` 至 `## 12` 全部 13 个章节（严禁删减合并章节、严禁省略西柚 `xydc-mcp` 第 `0.2` / `1.4` / `1.9` 专节与双轨排名表、严禁在活动级操作中挑活动省略在跑活动）**，不要把 TSV 当最终交付物。第 `0.4` 节必须呈现北极星总览预期对账卡，第 `1.9` 节必须呈现西柚全域流量与五阶双轨排名协同矩阵及盲区拓词表，第 `2` 节必须完整输出《历史调控台账与调后效果复盘对账总表》，第 `4` 节、第 `5` 节与 `bulk_adjustments.tsv` 三方参数必须 100% 一致。
 
 ### 3. 建产品画像
 

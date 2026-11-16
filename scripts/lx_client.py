@@ -99,6 +99,9 @@ def _resolve_mcp_config() -> dict[str, str]:
 
 _config_cache: dict[str, str] | None = None
 _config_lock = threading.Lock()
+_call_lock = threading.Lock()
+_last_call_time = 0.0
+_MIN_CALL_INTERVAL = 0.8
 
 
 def load_mcp_config() -> dict[str, str]:
@@ -112,6 +115,7 @@ def load_mcp_config() -> dict[str, str]:
 
 
 def rpc(method: str, params: dict | None = None, timeout: int = 120, max_retries: int = 3) -> dict[str, Any]:
+    global _last_call_time
     cfg = load_mcp_config()
     payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params or {}}
     req_data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -123,6 +127,13 @@ def rpc(method: str, params: dict | None = None, timeout: int = 120, max_retries
     
     last_err = None
     for attempt in range(max_retries):
+        with _call_lock:
+            now = time.time()
+            wait = _MIN_CALL_INTERVAL - (now - _last_call_time)
+            if wait > 0:
+                time.sleep(wait)
+            _last_call_time = time.time()
+
         req = urllib.request.Request(
             cfg["url"],
             data=req_data,
@@ -191,25 +202,46 @@ _searched_tools: set[str] = set()
 _searched_lock = threading.Lock()
 
 
+def _is_rate_limited(res: Any) -> bool:
+    raw_str = str(res)
+    if "工具参数" in raw_str or "刷新工具列表" in raw_str:
+        return False
+    return "频繁请求" in raw_str or '"code":429' in raw_str or "rate limit" in raw_str.lower()
+
+
 def _needs_schema_refresh(res: Any) -> bool:
-    """A 422 means the server rejected our params; re-fetching the tool schema may fix it."""
+    """A 422 or code 102 with parameter update means the server rejected our params or requires schema search."""
     msg = res.get("msg", "") if isinstance(res, dict) else ""
     raw_str = str(res)
-    return "status: 422" in raw_str or "422" in str(msg) or "工具参数" in raw_str
+    return "status: 422" in raw_str or "422" in str(msg) or "工具参数" in raw_str or "刷新工具列表" in raw_str
 
 
 def action(tool_id: str, params: dict | None = None) -> Any:
-    res = call_tool("action", {"toolId": tool_id, "params": params or {}})
-    if not _needs_schema_refresh(res):
-        return res
     with _searched_lock:
-        already_searched = tool_id in _searched_tools
-        if not already_searched:
-            _searched_tools.add(tool_id)
-    if already_searched:
+        if tool_id not in _searched_tools:
+            try:
+                search(tool_id)
+                _searched_tools.add(tool_id)
+                time.sleep(0.3)
+            except Exception:
+                pass
+
+    res = {}
+    for attempt in range(6):
+        res = call_tool("action", {"toolId": tool_id, "params": params or {}})
+        if _needs_schema_refresh(res) and attempt == 0:
+            with _searched_lock:
+                search(tool_id)
+                _searched_tools.add(tool_id)
+                time.sleep(0.5)
+            continue
+        if _is_rate_limited(res):
+            time.sleep(2.0 * (attempt + 1))
+            continue
         return res
-    search(tool_id)
-    return call_tool("action", {"toolId": tool_id, "params": params or {}})
+    if _is_rate_limited(res):
+        raise LingxingError(f"Lingxing API rate limited for {tool_id}: {res}")
+    return res
 
 
 def unwrap(obj: Any) -> Any:
@@ -277,7 +309,12 @@ def paginate(tool_id: str, base_params: dict, page_key: str = "page", start: int
         payload = action(tool_id, params)
         chunk = rows(payload)
         if not chunk:
-            break
+            if _is_rate_limited(payload):
+                time.sleep(2.0)
+                payload = action(tool_id, params)
+                chunk = rows(payload)
+            if not chunk:
+                break
         all_rows.extend(chunk)
         if len(chunk) < length:
             break

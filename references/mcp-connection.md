@@ -1,12 +1,14 @@
-# 领星 MCP 连接
+# 领星 MCP (`LingXing-MCP`) 与西柚洞察 (`xydc-mcp`) 双引擎连接指南
 
-## 配置位置
+本 Skill 同时联动 **领星 OpenMCP (`LingXing-MCP`)**（拉取真实广告多切片报表、三展位报告、订单财务毛利、业务报告流量与操作审计日志）与 **西柚洞察 (`xydc-mcp`)**（拉取真实自然排名 vs 广告位排名、本品与竞品 7d 自然/广告流量护城河、父体四渠道流量拆解、14d 收录词数趋势、BSR 排名走势与每日价格/秒杀轨迹）。
 
-支持以下三种配置方式（`lx_client.py` 会按顺序自动识别）：
+> ⚠️ **安全红线**：永远不要在终端、报告或聊天窗口打印、复述任何 `X-Mcp-Key`、`Authorization` Token 或 Open API Secret！
 
-### 1. Antigravity 全局配置（推荐）
+---
 
-在 `~/.gemini/config/mcp_config.json`（或项目 `.gemini/mcp_config.json`）中添加：
+## 一、配置位置（`lx_client.py` 与 `xydc_client.py` 自动按序识别）
+
+### 1. Antigravity 全局配置（推荐：`~/.gemini/config/mcp_config.json`）
 
 ```json
 {
@@ -14,26 +16,29 @@
     "lingxing-mcp": {
       "url": "https://openmcp.lingxing.com/mcp-servers/lingxing-mcp",
       "headers": {
-        "X-Mcp-Key": "<用户自己的 key，不要写进 skill 或聊天>"
+        "X-Mcp-Key": "<用户自己的领星 Key，不要写进 skill 或聊天>"
+      }
+    },
+    "xydc-mcp": {
+      "url": "<西柚洞察 MCP Streamable HTTP Endpoint>",
+      "headers": {
+        "Authorization": "Bearer <用户自己的西柚洞察 Token，不要写进 skill 或聊天>"
       }
     }
   }
 }
 ```
 
-### 2. 环境变量（轻量/CI/脚本推荐）
+### 2. 环境变量（轻量 / CI / 定时自动化脚本支持）
 
-```bash
+```powershell
 # Windows PowerShell
-$env:LINGXING_MCP_KEY="<你的_key>"
-
-# Linux / macOS
-export LINGXING_MCP_KEY="<你的_key>"
+$env:LINGXING_MCP_KEY="<你的领星_Key>"
+# 可选：$env:LINGXING_MCP_URL="https://openmcp.lingxing.com/mcp-servers/lingxing-mcp"
+# 可选：$env:XYDC_MCP_URL="<西柚_URL>" ; $env:XYDC_MCP_KEY="<西柚_Token>"
 ```
 
-### 3. Codex 配置（兼容原有模式）
-
-`%USERPROFILE%\.codex\config.toml`（Linux/macOS 为 `~/.codex/config.toml`）：
+### 3. Codex 配置（兼容 `~/.codex/config.toml`）
 
 ```toml
 [mcp_servers.lingxing-mcp]
@@ -41,62 +46,44 @@ enabled = true
 url = "https://openmcp.lingxing.com/mcp-servers/lingxing-mcp"
 
 [mcp_servers.lingxing-mcp.http_headers]
-X-Mcp-Key = "<用户自己的 key，不要写进 skill 或聊天>"
+X-Mcp-Key = "<用户自己的领星 Key，不要写进 skill 或聊天>"
 ```
 
-> ⚠️ **安全红线**：永远不要把 key 复述或打印出来。Open API IP 白名单是另一条路，默认继续用 MCP。
+---
 
-## 调用面
+## 二、调用机制与客户端回退
 
-领星 OpenMCP 不是“每个报表一个 MCP tool”。对外三个入口：
+### 1. 领星 OpenMCP (`scripts/lx_client.py`)
+领星 OpenMCP 对外提供三个标准入口：
 
 | 入口 | 用途 |
 |---|---|
-| `help` | 列 toolId |
-| `search` | `{ "toolId": "ad_campaign_report" }` 拿 inputSchema |
-| `action` | `{ "toolId": "...", "params": { ... } }` 真正取数 |
+| `help` | 列出所有可用 `toolId` |
+| `search` | `{ "toolId": "ad_campaign_report" }` 获取指定接口 `inputSchema` |
+| `action` | `{ "toolId": "...", "params": { ... } }` 真正执行数据拉取 |
 
-HTTP 回退（当前会话经常没有原生 MCP tools）：
+当会话无原生 MCP 工具或由后台定时任务直接执行 Python 脚本时，`scripts/lx_client.py` 自动通过 HTTP JSON-RPC (`tools/call`) 直连，支持 SSE / JSON 双响应解析与 `lx_client.unwrap()` 多层嵌套解包。
 
-- URL: `https://openmcp.lingxing.com/mcp-servers/lingxing-mcp`
-- JSON-RPC `tools/call`
-- Header: `X-Mcp-Key`, `Accept: application/json, text/event-stream`, `Content-Type: application/json; charset=utf-8`
-- 返回 `result.content[].text`，再 `json.loads`
+### 2. 西柚洞察 MCP (`scripts/xydc_client.py`)
+西柚洞察每个功能为独立 MCP Tool，`fetch_ads_bundle.py` 在取数阶段自动通过 `scripts/xydc_client.py` 顺序调用 6 个高价值只读接口并缓存至工作目录：
+1. `get_asin_keywords` → `work/lx-ads/xydc_ranks.json`（自然位 `OR`、广告位 `SP`/`SB`、词级流量得分与增速）
+2. `get_asin_info_trends` → `work/lx-ads/deal_info.json`（融合领星秒杀/专享折与西柚近 30 天每日挂牌价、秒杀价、Coupon、Prime 专享折轨迹）
+3. `get_asin_traffic` → `work/lx-ads/xydc_traffic.json`（本品 + Top 8 投放竞品 ASIN 近 7 天自然/广告流量得分、自然占比与收录词数）
+4. `get_parent_asin_ad_overview` → `work/lx-ads/xydc_traffic.json`（父体变体结构与 `organic / sp / sb / sbv` 四渠道流量占比）
+5. `get_asin_keyword_count_trends` → `work/lx-ads/xydc_traffic.json`（近 14 天每日自然词与广告词收录趋势）
+6. `get_asin_bsr_trends` → `work/lx-ads/xydc_traffic.json`（近 14 天大小类目 BSR 每日走势）
 
-用 `scripts/lx_client.py`，不要手写一堆含 key 的临时脚本。
+---
 
-## 店铺解析（ASIN + 国家）
+## 三、店铺与组合自动定位流程（ASIN + 国家）
 
-1. `ad_auth_shops`：字段 `alias`（店铺名）、`country`（US/UK/DE…）、`sid`、`profile_id`、`real_status`。
-2. 按国家过滤；用户给了店铺名就匹配 `alias`（大小写不敏感）。
-3. 同一国家多个店铺：对每个 `sid` 调 `erp_listing`（`search_field=asin`, `search_value=[ASIN]`, `exact_search=1`），命中谁用谁。
-4. 广告报表用 `profile_ids: ["<profile_id>"]`；Listing/库存用 `sid`。
-5. 可选：用户点名广告组合时，用 `ad_portfolio_report_shop` 或活动名/portfolio_id 收窄。没点名就先按 ASIN 的 `ad_campaign_product_report` 找到所有在投活动，再反查组合。
+1. `ad_auth_shops`：按国家过滤（注意英国在领星里为 `UK`，西柚洞察里同样传 `US/UK/DE/...`）；用户指定店铺名时大小写不敏感匹配 `alias`。
+2. 同一国家多店铺时：对候选 `sid` 调用 `erp_listing`（`search_field="asin"`, `search_value=[ASIN]`, `exact_search="1"`）或 `ad_campaign_product_report`（`profile_id=int(pid)`）精准锁定在投店铺与所属广告组合（Portfolio）。
+3. 广告报表使用 `profile_ids: ["<profile_id>"]`；财务利润表 `query_order_profit_list` 返回多店共享 ASIN 时，优先精确匹配单店 `sids == [sid]` 行核算当前组合保本线，同时保留跨店全盘汇总。
 
-英国在领星里是 `UK` 不是 `GB`。
+---
 
-## 日期窗口
+## 四、默认窗口与只读安全边界
 
-默认：昨天往前 **30 天**（否定词需要更长样本）。
-
-```
-report_date = "YYYY-MM-DD - YYYY-MM-DD"
-```
-
-用户明确要求 7/14 天才改短窗口。不要把仓库里几个月前的 JSON 当当前表现。
-
-## 分页与外壳
-
-- 报表几乎都是 `page` + `length`（建议 100）。一直翻到空页或不足一页。
-- 返回经常套两层 `{code, data:{code, data:{list: [...]}}}`。用 `lx_client.unwrap()`。
-- **第一行常常是合计**：`name` / `campaign_name` / `keyword_text` 为空。分析时丢掉。
-
-## 只读 vs 写入
-
-本 skill 默认只读。写入工具（用户明确要求才用）：
-
-- `put_campaigns_sp` / `put_adGroups_sp` / `put_targets_sp`
-- `advertising_add_negative_keywords` / `advertising_add_negative_targets`
-- `advertising_sp_add_keywords` / `post_keywords`
-
-写之前必须先 `search` schema，并且只改用户确认过的活动。
+- **多切片鲜活窗口**：默认以昨天（`T-1`）为锚点同步拉取 **30 天宏观基线 + 近 7 天中期走向 + 近 3 天微观切片**，严禁拿几个月前的陈旧缓存冒充当前实时表现。
+- **默认严格只读**：本 Skill 默认仅拉取只读分析数据并生成 `.md` 操盘手册与 `.tsv` 批量调整表，绝不自动调用 `put_campaigns_sp`、`put_adGroups_sp`、`put_targets_sp`、`advertising_add_negative_keywords` 等写接口。仅在用户明确指令“帮我写回后台”且逐项确认活动与金额后，方可先 `search` schema 再执行受控写入。
