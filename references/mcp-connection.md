@@ -1,6 +1,6 @@
 # 领星 MCP (`LingXing-MCP`) 与西柚洞察 (`xydc-mcp`) 双引擎连接指南
 
-本 Skill 同时联动 **领星 OpenMCP (`LingXing-MCP`)**（拉取真实广告多切片报表、三展位报告、订单财务毛利、业务报告流量与操作审计日志）与 **西柚洞察 (`xydc-mcp`)**（拉取真实自然排名 vs 广告位排名、本品与竞品 7d 自然/广告流量护城河、父体四渠道流量拆解、14d 收录词数趋势、BSR 排名走势与每日价格/秒杀轨迹）。
+本 Skill 同时联动 **领星 OpenMCP (`LingXing-MCP`)**（拉取真实广告多切片报表、真实四展位报告、订单财务毛利、业务报告流量与操作审计日志）与 **西柚洞察 (`xydc-mcp`)**（拉取真实自然排名 vs 广告位排名、本品与竞品 7d 自然/广告流量护城河、父体四渠道流量拆解、14d 收录词数趋势、BSR 排名走势与每日价格/秒杀轨迹）。
 
 > ⚠️ **安全红线**：永远不要在终端、报告或聊天窗口打印、复述任何 `X-Mcp-Key`、`Authorization` Token 或 Open API Secret！
 
@@ -22,12 +22,22 @@
     "xydc-mcp": {
       "url": "<西柚洞察 MCP Streamable HTTP Endpoint>",
       "headers": {
-        "Authorization": "Bearer <用户自己的西柚洞察 Token，不要写进 skill 或聊天>"
+        "Authorization": "Bearer <用户自己的西柚洞察主账号 Token，不要写进 skill 或聊天>"
+      }
+    },
+    "xydc-mcp-backup": {
+      "url": "<西柚洞察 MCP Streamable HTTP Endpoint>",
+      "headers": {
+        "Authorization": "Bearer <可选：西柚洞察备用账号 Token，主账号额度受限时自动切换>"
       }
     }
   }
 }
 ```
+
+> 💡 **西柚多账号自动容灾切换**：在 `mcp_config.json` 中增加 `xydc-mcp-backup`（或 `xydc-mcp-2` 等任意 `xydc*` 前缀备用节点）后：
+> - **脚本直连 (`scripts/xydc_client.py`)**：自动按主→备顺序加载全部账号。首次调用前通过免费接口 `get_account_credit_quota`（0 消耗）跳过已耗尽账号；运行中若主账号触发 401/402/403/429、额度不足或限流，自动无缝切换至 `xydc-mcp-backup` 重试并粘性保持，确保定时任务与全量取数不断流。可随时运行 `python scripts/xydc_client.py --check-quota` 免费查看各账号周/月剩余额度。
+> - **原生 MCP 调用**：当调用 `xydc-mcp` 返回额度受限 / `callable: false` / 402 / 429 时，直接改用 `xydc-mcp-backup` 发起同名工具调用即可。
 
 ### 2. 环境变量（轻量 / CI / 定时自动化脚本支持）
 
@@ -85,5 +95,5 @@ X-Mcp-Key = "<用户自己的领星 Key，不要写进 skill 或聊天>"
 
 ## 四、默认窗口与只读安全边界
 
-- **多切片鲜活窗口**：默认以昨天（`T-1`）为锚点同步拉取 **30 天宏观基线 + 近 7 天中期走向 + 近 3 天微观切片**，严禁拿几个月前的陈旧缓存冒充当前实时表现。
+- **多切片鲜活窗口**：默认以昨天（`T-1`）为锚点同步拉取 **30 天宏观基线 + 近 14 天/近 7 天转化主窗口 + 近 3 天微观切片**，严禁拿几个月前的陈旧缓存冒充当前实时表现。
 - **默认严格只读**：本 Skill 默认仅拉取只读分析数据并生成 `.md` 操盘手册与 `.tsv` 批量调整表，绝不自动调用 `put_campaigns_sp`、`put_adGroups_sp`、`put_targets_sp`、`advertising_add_negative_keywords` 等写接口。仅在用户明确指令“帮我写回后台”且逐项确认活动与金额后，方可先 `search` schema 再执行受控写入。

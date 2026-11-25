@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from datetime import datetime
@@ -15,7 +16,7 @@ from pathlib import Path
 
 SKILL_SCRIPTS = Path(__file__).resolve().parent
 SKILL_DIR = SKILL_SCRIPTS.parent
-DEFAULT_BASE_DIR = Path(r"E:\shardor\antigravity\领星广告")
+DEFAULT_BASE_DIR = Path(os.environ.get("LINGXING_ADS_WORKSPACE") or (Path.cwd() / "lingxing-ads"))
 
 sys.path.insert(0, str(SKILL_SCRIPTS))
 import lx_client as lx
@@ -87,6 +88,26 @@ def ensure_portfolio_structure(
     }
 
 
+def _read_markdown_text_safe(target: Path) -> str:
+    """Read markdown file safely across UTF-8, UTF-8-SIG, GB18030, or mixed-encoding lines without double-encoding."""
+    raw = target.read_bytes()
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raw = raw[3:]
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        decoded_lines: list[str] = []
+        for b_line in raw.splitlines():
+            try:
+                decoded_lines.append(b_line.decode("utf-8"))
+            except UnicodeDecodeError:
+                try:
+                    decoded_lines.append(b_line.decode("gb18030"))
+                except UnicodeDecodeError:
+                    decoded_lines.append(b_line.decode("utf-8", errors="replace"))
+        return "\n".join(decoded_lines)
+
+
 def register_in_portfolio_index(base_dir: Path, portfolio_name: str, asin: str, shop: str) -> None:
     """Automatically append newly created portfolio to PORTFOLIO_INDEX.md and README.md if not present."""
     index_file = base_dir / "PORTFOLIO_INDEX.md"
@@ -94,7 +115,11 @@ def register_in_portfolio_index(base_dir: Path, portfolio_name: str, asin: str, 
     for target in [index_file, readme_file]:
         if not target.exists():
             continue
-        content = target.read_text(encoding="utf-8")
+        try:
+            content = _read_markdown_text_safe(target)
+        except Exception as exc:
+            print(f"Warning: could not read {target}: {exc}", file=sys.stderr)
+            continue
         if f"`{portfolio_name}`" in content:
             continue
         lines = content.splitlines()
@@ -104,11 +129,15 @@ def register_in_portfolio_index(base_dir: Path, portfolio_name: str, asin: str, 
                 insert_idx = i + 1
         if insert_idx > 0:
             new_row = (
-                f"| + | [`{portfolio_name}`]({portfolio_name}/) | `{asin}` | {shop or 'DILU'} "
+                f"| + | [`{portfolio_name}`]({portfolio_name}/) | `{asin}` | {shop or 'DEFAULT_SHOP'} "
                 f"| 自动建档-新增组合 | 0 份 | 0 份 | 0 份 | 已就绪 |"
             )
             lines.insert(insert_idx, new_row)
-            target.write_text("\n".join(lines), encoding="utf-8")
+            try:
+                with target.open("w", encoding="utf-8", newline="\n") as fh:
+                    fh.write("\n".join(lines) + "\n")
+            except Exception as exc:
+                print(f"Warning: could not update {target}: {exc}", file=sys.stderr)
 
 
 def resolve_portfolio_name(asin: str, country: str, shop_alias: str | None = None) -> tuple[str, str, str]:
@@ -170,11 +199,11 @@ def resolve_portfolio_name(asin: str, country: str, shop_alias: str | None = Non
 
         if pf_spend:
             best_pf = max(pf_spend.items(), key=lambda kv: kv[1])[0]
-            return best_pf, str(shop.get("alias") or "DILU"), asin
+            return best_pf, str(shop.get("alias") or "DEFAULT_SHOP"), asin
     except Exception as exc:
         print(f"Warning: auto-probe failed ({exc})", file=sys.stderr)
 
-    return f"{asin}-{country}-portfolio", shop_alias or "DILU", asin
+    return f"{asin}-{country}-portfolio", shop_alias or "DEFAULT_SHOP", asin
 
 
 def _recover_meta_from_existing_workspace(portfolio_dir: Path) -> dict:
@@ -190,9 +219,13 @@ def _recover_meta_from_existing_workspace(portfolio_dir: Path) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Portfolio-First Advertising Audit Runner")
     parser.add_argument("--portfolio", default=None, help="Advertising portfolio name (folder name)")
-    parser.add_argument("--asin", default=None, help="Target ASIN (e.g. B0FPC98VJ1)")
+    parser.add_argument("--asin", default=None, help="Target ASIN (e.g. B0XXXXXXXX)")
     parser.add_argument("--country", default="US", help="Target marketplace/country (default: US)")
-    parser.add_argument("--shop", default=None, help="Shop alias (e.g. dilu)")
+    parser.add_argument("--shop", default=None, help="Shop alias (e.g. my_shop)")
+    parser.add_argument("--rules", default=None, help="Optional path to product_rules.json passed to analyze_ads_bundle.py")
+    parser.add_argument("--mode", default=None, help="Optional lifecycle stage mode: AUTO|LAUNCH|GROWTH|PROFIT|DEFEND|STOP_LOSS|CLEARANCE (supports +PEAK)")
+    parser.add_argument("--peak", action="store_true", help="Explicitly enable PEAK (promo/BFCM/Prime Day) overlay")
+    parser.add_argument("--no-peak", action="store_true", dest="no_peak", help="Explicitly disable PEAK overlay")
     parser.add_argument("--target-acos", type=float, default=None, help="Target ACOS threshold (e.g. 25.0)")
     parser.add_argument("--base-dir", default=str(DEFAULT_BASE_DIR), help="Base directory for advertising portfolios")
     parser.add_argument("--concurrency", type=int, default=6, help="Report fetching concurrency")
@@ -233,7 +266,7 @@ def main() -> int:
 
     dirs = ensure_portfolio_structure(portfolio_dir, clean_portfolio_name, asin or "", shop or "")
     if asin:
-        register_in_portfolio_index(base_dir, clean_portfolio_name, asin, shop or "DILU")
+        register_in_portfolio_index(base_dir, clean_portfolio_name, asin, shop or "DEFAULT_SHOP")
 
     fetch_script = SKILL_SCRIPTS / "fetch_ads_bundle.py"
     fetch_cmd = [
@@ -277,6 +310,15 @@ def main() -> int:
         "--export-dir",
         str(dirs["outputs_dir"]),
     ]
+    if args.rules:
+        rules_path = Path(args.rules)
+        analyze_cmd.extend(["--rules", str(rules_path.resolve()) if rules_path.exists() else str(args.rules)])
+    if args.mode:
+        analyze_cmd.extend(["--mode", str(args.mode)])
+    if args.peak:
+        analyze_cmd.append("--peak")
+    if args.no_peak:
+        analyze_cmd.append("--no-peak")
     if args.target_acos is not None:
         analyze_cmd.extend(["--target-acos", str(args.target_acos)])
     if shop:

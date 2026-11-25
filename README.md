@@ -1,6 +1,6 @@
-# lingxing-ads-playbook
+# lingxing-ads-playbook (v2)
 
-亚马逊广告全链路智能诊断与实操调优 Skill：深度融合 **领星 OpenMCP (`LingXing-MCP`)** 多时间切片活数据（30天宏观基线 + 近7天中期走向 + 近3天最新微观切片、真实三广告位报表、订单级财务毛利、全域业务报告流量与后台操作审计日志）与 **西柚洞察 (`xydc-mcp`)** 六维全域搜索情报（自然位 vs 广告位排名、本品与竞品 7d 自然/广告流量护城河、父体四渠道占比、14d 收录词数趋势、大小类 BSR 走势与每日秒杀/价格轨迹），驱动 **北极星总览预期闭环对账、双窗口动态差分纠偏、跨期实体全量记忆与 AI 动态熔断体系**，输出完整 **13 节（`## 0` ~ `## 12`）专业操盘手册** 与 **零冲突可直接上传的批量操作表**。
+亚马逊广告全链路智能诊断与实操调优 Skill（v2 阶段驱动 · 利润约束 · 自然排名导向）：深度融合 **领星 OpenMCP (`LingXing-MCP`)** 多时间切片活数据（30d/14d/7d/3d 切片、真实四展位报表、订单级财务毛利、全域业务报告流量与后台操作审计日志）与 **西柚洞察 (`xydc-mcp`)** 六维全域搜索情报（自然位 vs 广告位排名、本品与竞品 7d 自然/广告流量护城河、父体四渠道占比、14d 收录词数趋势、大小类 BSR 走势与每日秒杀/价格轨迹），先定产品阶段与经营目标，再执行 **TCPA/CVR 动态缩放、双向单杠杆变更纪律、全局变更预算与北极星预期闭环对账**，输出完整 **13 节（`## 0` ~ `## 12`，含必选 `0.0` 阶段目标卡）专业操盘手册** 与 **零冲突可直接上传的 7 列批量操作表**。
 
 本仓库仅包含 Skill 源代码、诊断框架与模版规范，**绝不包含**：
 - 任何真实的领星 MCP Key / 西柚洞察 Token / Open API Secret / 认证凭据
@@ -13,16 +13,16 @@
 
 1. **北极星总览预期闭环与外部干扰剥离 (`macro_scorecard.tsv`)**：
    - 自动按日追踪全店真实美元销售额、总单量、自然单量与占比、真实全店 TACOS、访客 Sessions、购物车率与小类 BSR，逐期核验是否达成上期持久化预期 (`db/expectations/`)；
-   - 前置剥离断货、低库存、购物车丢失、日常涨价、秒杀结束降温与 Listing 文案改动 6 类非广告干扰；一旦监测到砍广告引发大盘单量萎缩，立即激活 `VELOCITY_SHRINKAGE_ALERT` 缩量防线。
+   - 前置剥离断货、低库存、购物车丢失、日常涨价、秒杀结束降温、大促后 10~14 天回落（`CONF_PEAK_POST_COOLDOWN`）与 Listing 文案改动 7 类非广告干扰；一旦监测到砍广告引发大盘单量萎缩，立即激活 `VELOCITY_SHRINKAGE_ALERT` 缩量防线。
 2. **西柚洞察 (`xydc-mcp`) 六接口全栈深度协同**：
    - 接入 `get_asin_keywords`、`get_asin_traffic`、`get_parent_asin_ad_overview`、`get_asin_keyword_count_trends`、`get_asin_bsr_trends`、`get_asin_info_trends`；
    - 构建五阶自然排名 vs 广告排名双轨协同矩阵 (`rank_synergy.tsv`，精确核算 `0~100%` 本品自然/广告流量占比与跨期 `ΔOR`/`ΔSP`)、对标竞品 7d 自然流量护城河表 (`xydc_competitor_benchmark.tsv`) 以及 **Tier 5 自然流量盲区高潜拓词表 (`xydc_blindspot_opportunities.tsv`)**。
-3. **多切片双轨保鲜与真实三广告位 + 竞价策略穿透**：
-   - 同步拉取截至昨天（`T-1`）的 30d / 7d / 3d 鲜活切片及 `get_sp_campaign_placement_report` 真实 `TOS / PP / ROS` 三展位表现 (`real_placement_performance.tsv`)，保护高投产真实商品页/其余位，精准识别 `动态竞价 - 提高和降低` 的 `2.0x` 顶展叠加失血。
+3. **多切片双轨保鲜与真实全展位（含 `OFF AMAZON`）+ 竞价策略穿透**：
+   - 同步拉取截至昨天（`T-1`）的 30d / 14d / 7d / 3d 鲜活切片及 `get_sp_campaign_placement_report` 真实 `TOS / PP / ROS / OFF AMAZON` 全展位表现 (`real_placement_performance.tsv`，单活动 100% 归一化)，保护高投产真实商品页/其余位/站外流量，对高耗低效站外失血差异化止血，并精准识别 `动态竞价 - 提高和降低` 的 `2.0x` 顶展叠加失血。
 4. **跨会话实体全量记忆与防滑坡/防左右横跳 (`db/ledger/` & `db/entity_memory/`)**：
    - 永久追踪每个活动、关键词与 ASIN 投放的前次调整动作、调后 `ΔCPC%` / `ΔImp%` 以及跨期自然位/广告位进退 (`entity_full_context.tsv`)；核心出单词自然位下滑 `≥ 4` 名时自动触发 `Rank_Slide_Protection_Hold` 严禁顺周期叠砍竞价。
 5. **两阶段移词闭环与零冲突批量表仲裁 (`resolve_entity_action_conflicts`)**：
-   - 完整覆盖第 1 阶段倒推竞价软交接与第 2 阶段源仓精准否定隔离，代码底层对同一 `(campaign, target_entity)` 严格执行优先级唯一胜出仲裁，确保 `bulk_adjustments.tsv` 零重复冲突、严格 7 列纯绝对美元数值。
+   - 完整覆盖第 1 阶段倒推竞价软交接与第 2 阶段源仓精准否定隔离，代码底层对同一 `(campaign, match_type, target_entity)` 严格执行优先级唯一胜出仲裁，确保 `bulk_adjustments.tsv` 零重复冲突、严格 7 列纯绝对美元数值。
 6. **完整 13 节 (`## 0` ~ `## 12`) 高信息密度手册交付**：
    - 严格保持 `## 0` 产品对标与财务北极星底线 → `## 1` 多窗口大盘与西柚全域双轨协同 → `## 2` 历史调控台账对账 → `## 3` 执行时序 → `## 4` 位置溢价一套数总表 → `## 5` 全活动分仓逐词四行卡片 → `## 6` 目标架构 → `## 7` 否定词全生命周期 → `## 8` 因果逻辑 → `## 9` Listing 协同 → `## 10` 熔断与 7 天量化验收 → `## 11` 今日可勾选清单 → `## 12` 配套批量表索引。
 
@@ -45,7 +45,8 @@
 ```bash
 # 一键完成组合工作区建档、领星+西柚双引擎取数、全量分析与跨期对账：
 python ~/.gemini/config/skills/lingxing-ads-playbook/scripts/run_portfolio_audit.py \
-    --portfolio <广告组合名> --asin <ASIN> --country <US|UK|DE> --shop <SHOP_ALIAS>
+    --portfolio <广告组合名> --asin <ASIN> --country <US|UK|DE> --shop <SHOP_ALIAS> \
+    [--mode AUTO|LAUNCH|GROWTH|PROFIT|DEFEND|STOP_LOSS|CLEARANCE] [--peak|--no-peak] [--rules <rules.json>]
 ```
 
 ---
@@ -54,20 +55,22 @@ python ~/.gemini/config/skills/lingxing-ads-playbook/scripts/run_portfolio_audit
 
 ```
 lingxing-ads-playbook/
-├── SKILL.md                          # 70 条一线操盘核心铁律与端到端标准化流程
+├── SKILL.md                          # v2 阶段驱动决策框架（§0~§10 + 附录A可配参数 + 附录B脚本契约）
 ├── README.md                         # 仓库说明与部署使用指南
 ├── agents/
 │   └── openai.yaml                   # LingXing-MCP + xydc-mcp 双引擎依赖声明
 ├── references/
-│   ├── analysis-framework.md         # 37 节深度分析框架（北极星对账、双轨排名、真实三展位、熔断与重生SOP）
+│   ├── analysis-framework.md         # 全量深度分析框架（含 §40 v2 阶段引擎、TCPA缩放、单杠杆与持续校准）
 │   ├── mcp-connection.md             # 领星 MCP 与西柚洞察 MCP 连接与鉴权规范
-│   ├── product-rules-template.json   # 全品类通用自定义分桶规则模版
-│   ├── report-template.md            # 13 节（## 0 ~ ## 12）全量深度交付手册标准模版
+│   ├── product-rules-template.json   # v2 全品类通用规则与附录A参数覆盖模板（向下兼容旧版）
+│   ├── report-template.md            # 13 节（## 0 ~ ## 12，含必选 ### 0.0 阶段目标卡）全量深度手册模板
 │   └── tool-params.md                # 领星 MCP 与西柚洞察 6 大接口参数与避坑指南
 └── scripts/
-    ├── run_portfolio_audit.py        # 广告组合专属工作区一键调度入口
-    ├── fetch_ads_bundle.py           # 领星多窗口切片 + 真实展位 + 西柚6接口全量取数器
-    ├── analyze_ads_bundle.py         # 智能分析引擎（北极星对账、双轨五阶协同、跨期记忆、零冲突TSV仲裁）
+    ├── v2_policy.py                  # v2 核心策略引擎（6阶段+PEAK、TCPA/贝叶斯CVR、单杠杆、全局变更预算、作战表、预算再分配、SB/SD体检、持续校准）
+    ├── run_portfolio_audit.py        # 广告组合专属工作区一键调度入口（支持 --mode / --peak / --no-peak）
+    ├── fetch_ads_bundle.py           # 领星多窗口切片（30d/14d/7d/3d）+ 真实四展位 + 西柚6接口全量取数器
+    ├── analyze_ads_bundle.py         # 智能分析引擎（100%兼容本地历史 db/ 数据，输出零冲突7列批量表及配套计划表）
+    ├── validate_playbook_report.py   # 交付前硬门禁校验脚本（13节+0.0完整性、零KaTeX、单杠杆与溢价步长校验、--rules/--legacy-v1）
     ├── lx_client.py                  # 领星 OpenMCP JSON-RPC 客户端
     └── xydc_client.py                # 西柚洞察 (xydc-mcp) 6 接口客户端
 ```

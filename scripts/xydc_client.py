@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import threading
 import urllib.error
 import urllib.request
 from datetime import date, datetime, timedelta
@@ -13,48 +15,167 @@ from typing import Any
 
 DEFAULT_XYDC_URL = "https://mcp.xydc.com/mcp"
 
+_STATE_LOCK = threading.Lock()
+_EXHAUSTED_ACCOUNTS: set[str] = set()
+_ACTIVE_ACCOUNT_NAME: str | None = None
+_PREFLIGHT_DONE: bool = False
+
+_FAILOVER_HTTP_CODES = {401, 402, 403, 429}
+_FAILOVER_KEYWORDS = (
+    "monthly_exhausted",
+    "weekly_exhausted",
+    "account_disabled",
+    "insufficient",
+    "quota",
+    "credit",
+    "exhausted",
+    "limit exceeded",
+    "rate limit",
+    "too many requests",
+    "payment required",
+    "unauthorized",
+    "forbidden",
+    "not enough",
+    "token invalid",
+    "token expired",
+    "额度",
+    "积分",
+    "余额不足",
+    "配额",
+    "超限",
+    "受限",
+    "已用完",
+    "已耗尽",
+    "停用",
+    "无权限",
+    "限流",
+    "不足",
+)
+
+
+def reset_xydc_failover_state() -> None:
+    """Reset in-process failover state (useful for tests or manual refresh)."""
+    global _ACTIVE_ACCOUNT_NAME, _PREFLIGHT_DONE
+    with _STATE_LOCK:
+        _EXHAUSTED_ACCOUNTS.clear()
+        _ACTIVE_ACCOUNT_NAME = None
+        _PREFLIGHT_DONE = False
+
 
 def _gemini_home() -> Path:
     return Path(os.environ.get("GEMINI_HOME") or (Path.home() / ".gemini"))
 
 
-def resolve_xydc_config() -> dict[str, str]:
-    """Resolve the endpoint URL and Authorization token for xydc-mcp."""
-    url = os.environ.get("XYDC_MCP_URL") or DEFAULT_XYDC_URL
-    token = os.environ.get("XYDC_MCP_TOKEN") or ""
+def _format_bearer(token: str) -> str:
+    tok = token.strip()
+    if not tok:
+        return ""
+    return tok if tok.lower().startswith("bearer ") else f"Bearer {tok}"
 
-    if token:
-        auth_header = token if token.startswith("Bearer ") else f"Bearer {token}"
-        return {"url": url, "auth": auth_header}
 
+def resolve_xydc_configs() -> list[dict[str, str]]:
+    """Resolve all configured xydc-mcp accounts in priority order (primary first, then backups)."""
+    default_url = os.environ.get("XYDC_MCP_URL") or DEFAULT_XYDC_URL
+    accounts: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def _add(name: str, url: str, auth: str) -> None:
+        auth_norm = _format_bearer(auth)
+        url_norm = (url or default_url).strip() or DEFAULT_XYDC_URL
+        if not auth_norm:
+            return
+        key = (url_norm, auth_norm)
+        if key in seen:
+            return
+        seen.add(key)
+        accounts.append({"name": name, "url": url_norm, "auth": auth_norm})
+
+    # 1. Environment variables (single or multi-token)
+    multi_env = os.environ.get("XYDC_MCP_TOKENS") or ""
+    if multi_env.strip():
+        parts = [p.strip() for p in re.split(r"[,;\r\n]+", multi_env) if p.strip()]
+        for idx, tok in enumerate(parts, start=1):
+            label = "env:xydc-mcp" if idx == 1 else f"env:xydc-mcp-{idx}"
+            _add(label, default_url, tok)
+
+    for env_key, label in (
+        ("XYDC_MCP_TOKEN", "env:xydc-mcp"),
+        ("XYDC_MCP_KEY", "env:xydc-mcp"),
+        ("XYDC_MCP_TOKEN_BACKUP", "env:xydc-mcp-backup"),
+        ("XYDC_MCP_TOKEN_2", "env:xydc-mcp-2"),
+        ("XYDC_MCP_TOKEN_3", "env:xydc-mcp-3"),
+    ):
+        val = os.environ.get(env_key) or ""
+        if val.strip():
+            _add(label, default_url, val)
+
+    # 2. mcp_config.json (primary exact names first, then any xydc*/xiyou* backup servers)
     paths = [
         _gemini_home() / "config" / "mcp_config.json",
         Path.cwd() / ".gemini" / "mcp_config.json",
     ]
+    primary_names = ("xydc-mcp", "xydc", "xiyou")
     for p in paths:
-        if p.exists():
-            try:
-                cfg = json.loads(p.read_text(encoding="utf-8"))
-                servers = cfg.get("mcpServers") or cfg.get("mcp_servers") or {}
-                srv = servers.get("xydc-mcp") or servers.get("xydc") or servers.get("xiyou")
-                if srv and isinstance(srv, dict):
-                    url = srv.get("url") or srv.get("serverUrl") or url
+        if not p.exists():
+            continue
+        try:
+            cfg = json.loads(p.read_text(encoding="utf-8"))
+            servers = cfg.get("mcpServers") or cfg.get("mcp_servers") or {}
+            if not isinstance(servers, dict):
+                continue
+
+            # Primary first
+            for pname in primary_names:
+                srv = servers.get(pname)
+                if isinstance(srv, dict):
+                    srv_url = srv.get("url") or srv.get("serverUrl") or default_url
                     headers = srv.get("headers") or {}
                     auth = headers.get("Authorization") or headers.get("authorization") or ""
-                    if auth:
-                        return {"url": url, "auth": auth}
-            except Exception:
-                pass
+                    _add(pname, srv_url, auth)
 
-    return {"url": url, "auth": ""}
+            # Backup servers (e.g., xydc-mcp-backup, xydc-mcp-2, xiyou-backup)
+            backup_keys = sorted(
+                k for k in servers.keys()
+                if k not in primary_names
+                and (k.lower().startswith("xydc") or k.lower().startswith("xiyou"))
+            )
+            for bname in backup_keys:
+                srv = servers.get(bname)
+                if isinstance(srv, dict):
+                    srv_url = srv.get("url") or srv.get("serverUrl") or default_url
+                    headers = srv.get("headers") or {}
+                    auth = headers.get("Authorization") or headers.get("authorization") or ""
+                    _add(bname, srv_url, auth)
+        except Exception:
+            pass
+
+    return accounts
 
 
-def call_xydc_tool(tool_name: str, arguments: dict, timeout: int = 40) -> dict[str, Any]:
-    """Direct JSON-RPC call to xydc-mcp endpoint."""
-    cfg = resolve_xydc_config()
-    if not cfg.get("auth"):
-        return {"error": "Missing xydc-mcp authorization token in config"}
+def resolve_xydc_config() -> dict[str, str]:
+    """Resolve the currently active endpoint URL and Authorization token for xydc-mcp."""
+    accounts = resolve_xydc_configs()
+    if not accounts:
+        url = os.environ.get("XYDC_MCP_URL") or DEFAULT_XYDC_URL
+        return {"name": "xydc-mcp", "url": url, "auth": ""}
+    with _STATE_LOCK:
+        if _ACTIVE_ACCOUNT_NAME:
+            for acc in accounts:
+                if acc["name"] == _ACTIVE_ACCOUNT_NAME and acc["name"] not in _EXHAUSTED_ACCOUNTS:
+                    return acc
+        for acc in accounts:
+            if acc["name"] not in _EXHAUSTED_ACCOUNTS:
+                return acc
+    return accounts[0]
 
+
+def _single_xydc_call(
+    cfg: dict[str, str],
+    tool_name: str,
+    arguments: dict,
+    timeout: int = 40,
+) -> tuple[dict[str, Any], int | None, bool]:
+    """Execute one raw JSON-RPC call against a specific xydc account config."""
     payload = {
         "jsonrpc": "2.0",
         "id": 1,
@@ -76,11 +197,25 @@ def call_xydc_tool(tool_name: str, arguments: dict, timeout: int = 40) -> dict[s
         method="POST",
     )
 
+    http_status: int | None = 200
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
+            http_status = getattr(resp, "status", 200)
             body = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        http_status = exc.code
+        err_body = ""
+        try:
+            err_body = exc.read().decode("utf-8", errors="ignore")[:500]
+        except Exception:
+            pass
+        return (
+            {"error": f"HTTP {exc.code} calling xydc-mcp {tool_name}: {exc.reason}", "raw": err_body},
+            http_status,
+            True,
+        )
     except Exception as exc:
-        return {"error": f"Network error calling xydc-mcp {tool_name}: {exc}"}
+        return ({"error": f"Network error calling xydc-mcp {tool_name}: {exc}"}, None, False)
 
     trimmed = body.strip()
     if trimmed.startswith("data:"):
@@ -90,21 +225,189 @@ def call_xydc_tool(tool_name: str, arguments: dict, timeout: int = 40) -> dict[s
     try:
         res = json.loads(trimmed)
     except Exception as exc:
-        return {"error": f"xydc-mcp returned non-JSON: {exc}"}
+        return ({"error": f"xydc-mcp returned non-JSON: {exc}", "raw": trimmed[:300]}, http_status, False)
 
     if res.get("error"):
-        return {"error": res["error"]}
+        return ({"error": res["error"]}, http_status, True)
 
-    content = res.get("result", {}).get("content", [])
+    result_obj = res.get("result") if isinstance(res.get("result"), dict) else {}
+    is_mcp_error = bool(result_obj.get("isError"))
+    content = result_obj.get("content", [])
     if content and isinstance(content, list) and isinstance(content[0], dict):
         text = content[0].get("text", "")
         if text:
             try:
-                return json.loads(text)
+                parsed = json.loads(text)
+                if isinstance(parsed, dict):
+                    return (parsed, http_status, is_mcp_error)
+                return ({"data": parsed}, http_status, is_mcp_error)
             except Exception:
-                return {"raw": text}
+                return ({"raw": text}, http_status, is_mcp_error)
 
-    return res.get("result") or {}
+    return (result_obj or {}, http_status, is_mcp_error)
+
+
+def _is_failover_error(
+    parsed: dict[str, Any],
+    http_status: int | None,
+    is_mcp_error: bool,
+) -> tuple[bool, str]:
+    """Determine whether a response indicates quota exhaustion, rate-limit, or auth failure."""
+    if http_status in _FAILOVER_HTTP_CODES:
+        return (True, f"HTTP {http_status}")
+
+    if not isinstance(parsed, dict):
+        return (False, "")
+
+    # Check status/code fields inside unwrapped JSON payload
+    for code_key in ("status", "code", "statusCode", "httpStatus"):
+        val = parsed.get(code_key)
+        try:
+            if val is not None and int(val) in _FAILOVER_HTTP_CODES:
+                return (True, f"payload {code_key}={val}")
+        except (TypeError, ValueError):
+            pass
+
+    data_obj = parsed.get("data") if isinstance(parsed.get("data"), dict) else {}
+    if data_obj:
+        if data_obj.get("callable") is False:
+            restr = data_obj.get("restrictions") or []
+            return (True, f"callable=False restrictions={restr}")
+        if str(data_obj.get("accountStatus") or "").upper() == "DISABLED":
+            return (True, "accountStatus=DISABLED")
+
+    # Inspect error / message text if error flag or non-200 status is present
+    payload_status = parsed.get("status")
+    has_error_signal = (
+        is_mcp_error
+        or ("error" in parsed)
+        or (isinstance(payload_status, int) and payload_status >= 400)
+        or (parsed.get("success") is False)
+        or ("raw" in parsed and "data" not in parsed)
+    )
+    if has_error_signal:
+        fragments = [
+            str(parsed.get("error") or ""),
+            str(parsed.get("message") or ""),
+            str(parsed.get("msg") or ""),
+            str(parsed.get("raw") or ""),
+            str(data_obj.get("message") or ""),
+            str(data_obj.get("restrictions") or ""),
+        ]
+        haystack = " ".join(fragments).lower()
+        for kw in _FAILOVER_KEYWORDS:
+            if kw in haystack:
+                return (True, f"matched '{kw}'")
+
+    return (False, "")
+
+
+def check_account_quota(cfg: dict[str, str], timeout: int = 15) -> dict[str, Any]:
+    """Call the free get_account_credit_quota tool (0 credits) for a specific account."""
+    parsed, http_status, is_mcp_error = _single_xydc_call(
+        cfg,
+        "get_account_credit_quota",
+        {
+            "user_task": "查询西柚洞察 MCP 账号剩余额度",
+            "intent_summary": "检查该账号当前是否可调用及剩余周/月额度",
+        },
+        timeout=timeout,
+    )
+    should_failover, reason = _is_failover_error(parsed, http_status, is_mcp_error)
+    data = parsed.get("data") if isinstance(parsed.get("data"), dict) else {}
+    callable_flag = data.get("callable")
+    total_avail = data.get("totalAvailable")
+    if not should_failover and callable_flag is True and isinstance(total_avail, (int, float)) and total_avail <= 0:
+        should_failover = True
+        reason = f"totalAvailable={total_avail}"
+    return {
+        "name": cfg.get("name", "xydc-mcp"),
+        "ok": (not should_failover) and bool(data) and (callable_flag is not False),
+        "reason": reason,
+        "callable": callable_flag,
+        "total_available": total_avail,
+        "max_single_call": data.get("maxSingleCall"),
+        "weekly": data.get("weekly") or {},
+        "monthly": data.get("monthly") or {},
+        "restrictions": data.get("restrictions") or [],
+        "raw_response": parsed,
+    }
+
+
+def _preflight_select_account(accounts: list[dict[str, str]]) -> None:
+    """Once per process (when >1 accounts configured), use free quota check to skip already-exhausted accounts."""
+    global _ACTIVE_ACCOUNT_NAME, _PREFLIGHT_DONE
+    if len(accounts) <= 1:
+        return
+    with _STATE_LOCK:
+        if _PREFLIGHT_DONE:
+            return
+        _PREFLIGHT_DONE = True
+
+    for acc in accounts:
+        info = check_account_quota(acc)
+        if info["ok"]:
+            with _STATE_LOCK:
+                _ACTIVE_ACCOUNT_NAME = acc["name"]
+            if acc["name"] != accounts[0]["name"]:
+                print(
+                    f"[xydc-mcp] Pre-flight selected backup account '{acc['name']}' "
+                    f"(available={info.get('total_available')})"
+                )
+            return
+        with _STATE_LOCK:
+            _EXHAUSTED_ACCOUNTS.add(acc["name"])
+        print(
+            f"[xydc-mcp] Pre-flight skipping account '{acc['name']}' "
+            f"(reason={info.get('reason') or 'unavailable'})"
+        )
+
+
+def call_xydc_tool(tool_name: str, arguments: dict, timeout: int = 40) -> dict[str, Any]:
+    """Direct JSON-RPC call to xydc-mcp endpoint with automatic multi-account quota failover."""
+    global _ACTIVE_ACCOUNT_NAME
+    accounts = resolve_xydc_configs()
+    if not accounts:
+        return {"error": "Missing xydc-mcp authorization token in config"}
+
+    if tool_name != "get_account_credit_quota" and len(accounts) > 1:
+        _preflight_select_account(accounts)
+
+    with _STATE_LOCK:
+        active_name = _ACTIVE_ACCOUNT_NAME
+        exhausted_snapshot = set(_EXHAUSTED_ACCOUNTS)
+
+    # Build candidate order: active account first, then remaining non-exhausted accounts
+    candidates = [a for a in accounts if a["name"] not in exhausted_snapshot]
+    if not candidates:
+        # All accounts marked exhausted; try full list as last resort in case quota just reset
+        candidates = list(accounts)
+    elif active_name:
+        candidates.sort(key=lambda a: 0 if a["name"] == active_name else 1)
+
+    last_res: dict[str, Any] = {"error": f"No available xydc-mcp account for {tool_name}"}
+    for idx, acc in enumerate(candidates):
+        parsed, http_status, is_mcp_error = _single_xydc_call(acc, tool_name, arguments, timeout=timeout)
+        should_failover, reason = _is_failover_error(parsed, http_status, is_mcp_error)
+
+        if should_failover and idx < len(candidates) - 1:
+            next_acc = candidates[idx + 1]
+            with _STATE_LOCK:
+                _EXHAUSTED_ACCOUNTS.add(acc["name"])
+                _ACTIVE_ACCOUNT_NAME = next_acc["name"]
+            print(
+                f"[xydc-mcp] Account '{acc['name']}' quota/auth limited ({reason}); "
+                f"auto-switching to '{next_acc['name']}' and retrying {tool_name}"
+            )
+            last_res = parsed
+            continue
+
+        if not should_failover:
+            with _STATE_LOCK:
+                _ACTIVE_ACCOUNT_NAME = acc["name"]
+        return parsed
+
+    return last_res
 
 
 def _safe_float(x: Any) -> float:
@@ -361,6 +664,12 @@ def fetch_asin_traffic_intelligence(
         "bsr_trend": {},
     }
 
+    def _pick(d: dict[str, Any], *keys: str) -> Any:
+        for k in keys:
+            if d.get(k) is not None:
+                return d.get(k)
+        return None
+
     # 1. get_asin_traffic (Main ASIN + up to 8 top competitor ASINs in one batched call)
     traf_res = call_xydc_tool("get_asin_traffic", {
         "asins": batch_asins,
@@ -379,19 +688,40 @@ def fetch_asin_traffic_intelligence(
                 continue
             parsed_ent = {
                 "asin": e_asin,
-                "total_traffic_score": _safe_float(ent.get("totalTrafficScore")),
-                "prev_7d_total_traffic_score": _safe_float(ent.get("previous7DaysTotalTrafficScore")),
-                "total_growth_pct": round(_safe_float(ent.get("totalTrafficScoreGrowthRate")) * 100.0, 2),
-                "organic_traffic_score": _safe_float(ent.get("organicTrafficScore")),
-                "prev_7d_organic_traffic_score": _safe_float(ent.get("previous7DaysOrganicTrafficScore")),
-                "organic_growth_pct": round(_safe_float(ent.get("organicTrafficScoreGrowthRate")) * 100.0, 2),
-                "organic_share_pct": round(_safe_float(ent.get("organicTrafficScoreRatio")) * 100.0, 2),
-                "organic_keyword_count": int(_safe_float(ent.get("organicSearchTermCount"))),
-                "ad_traffic_score": _safe_float(ent.get("advertisingTrafficScore")),
-                "prev_7d_ad_traffic_score": _safe_float(ent.get("previous7DaysAdvertisingTrafficScore")),
-                "ad_growth_pct": round(_safe_float(ent.get("advertisingTrafficScoreGrowthRate")) * 100.0, 2),
-                "ad_share_pct": round(_safe_float(ent.get("advertisingTrafficScoreRatio")) * 100.0, 2),
-                "ad_keyword_count": int(_safe_float(ent.get("advertisingSearchTermCount"))),
+                "total_traffic_score": _safe_float(_pick(ent, "totalTraffic", "totalTrafficScore")),
+                "prev_7d_total_traffic_score": _safe_float(
+                    _pick(ent, "previous7DaysTotalTraffic", "previous7DaysTotalTrafficScore")
+                ),
+                "total_growth_pct": round(
+                    _safe_float(_pick(ent, "totalTrafficGrowthRate", "totalTrafficScoreGrowthRate")) * 100.0, 2
+                ),
+                "organic_traffic_score": _safe_float(_pick(ent, "organicTraffic", "organicTrafficScore")),
+                "prev_7d_organic_traffic_score": _safe_float(
+                    _pick(ent, "previous7DaysOrganicTraffic", "previous7DaysOrganicTrafficScore")
+                ),
+                "organic_growth_pct": round(
+                    _safe_float(_pick(ent, "organicTrafficGrowthRate", "organicTrafficScoreGrowthRate")) * 100.0, 2
+                ),
+                "organic_share_pct": round(
+                    _safe_float(_pick(ent, "organicTrafficRatio", "organicTrafficScoreRatio")) * 100.0, 2
+                ),
+                "organic_keyword_count": int(
+                    _safe_float(_pick(ent, "organicSearchTermCount", "organicKeywordCount"))
+                ),
+                "ad_traffic_score": _safe_float(_pick(ent, "advertisingTraffic", "advertisingTrafficScore")),
+                "prev_7d_ad_traffic_score": _safe_float(
+                    _pick(ent, "previous7DaysAdvertisingTraffic", "previous7DaysAdvertisingTrafficScore")
+                ),
+                "ad_growth_pct": round(
+                    _safe_float(_pick(ent, "advertisingTrafficGrowthRate", "advertisingTrafficScoreGrowthRate")) * 100.0,
+                    2,
+                ),
+                "ad_share_pct": round(
+                    _safe_float(_pick(ent, "advertisingTrafficRatio", "advertisingTrafficScoreRatio")) * 100.0, 2
+                ),
+                "ad_keyword_count": int(
+                    _safe_float(_pick(ent, "advertisingSearchTermCount", "advertisingKeywordCount"))
+                ),
             }
             if e_asin == asin_up:
                 result["self_traffic_7d"] = parsed_ent
@@ -409,32 +739,40 @@ def fetch_asin_traffic_intelligence(
     if isinstance(parent_res, dict) and "error" not in parent_res:
         p_data = parent_res.get("data", {}) if isinstance(parent_res.get("data"), dict) else {}
         scope = p_data.get("scope", {}) if isinstance(p_data.get("scope"), dict) else {}
+        raw_dist = _pick(p_data, "trafficDistribution", "trafficScoreDistribution") or []
         ch_dist = {}
-        for item in (p_data.get("trafficScoreDistribution") or []):
+        for item in raw_dist:
             if isinstance(item, dict) and item.get("source"):
                 ch_dist[str(item["source"])] = {
-                    "traffic_score": _safe_float(item.get("trafficScore")),
-                    "share_pct": round(_safe_float(item.get("shareOfTotalScore")) * 100.0, 2),
+                    "traffic_score": _safe_float(_pick(item, "traffic", "trafficScore")),
+                    "share_pct": round(
+                        _safe_float(_pick(item, "shareOfTotalTraffic", "shareOfTotalScore", "ratio")) * 100.0, 2
+                    ),
                 }
         tier_dist = {}
-        for item in (p_data.get("keywordTiers") or []):
+        for item in (_pick(p_data, "keywordTiers", "keywordTierDistribution") or []):
             if isinstance(item, dict) and item.get("tier"):
                 tier_dist[str(item["tier"])] = {
-                    "traffic_score": _safe_float(item.get("trafficScore")),
-                    "share_pct": round(_safe_float(item.get("ratio")) * 100.0, 2),
+                    "traffic_score": _safe_float(_pick(item, "traffic", "trafficScore")),
+                    "share_pct": round(
+                        _safe_float(_pick(item, "ratio", "shareOfTotalTraffic", "shareOfTotalScore")) * 100.0, 2
+                    ),
                 }
         variations = []
         for item in (p_data.get("topVariations") or []):
             if isinstance(item, dict) and item.get("asin"):
                 variations.append({
                     "asin": str(item.get("asin")).upper(),
-                    "ad_traffic_score": _safe_float(item.get("trafficScore")),
-                    "share_of_ad_score_pct": round(_safe_float(item.get("shareOfAdScore")) * 100.0, 2),
+                    "ad_traffic_score": _safe_float(_pick(item, "traffic", "trafficScore")),
+                    "share_of_ad_score_pct": round(
+                        _safe_float(_pick(item, "shareOfAdTraffic", "shareOfAdScore", "ratio")) * 100.0, 2
+                    ),
                 })
-        if scope or ch_dist:
+        if scope or ch_dist or tier_dist or variations:
             result["parent_ad_overview_7d"] = {
                 "parent_asin": scope.get("parentAsin"),
                 "total_variation_count": int(_safe_float(scope.get("totalVariationCount"))),
+                "included_variation_asins": scope.get("includedVariationAsins") or [],
                 "advertised_variation_count": int(_safe_float(p_data.get("advertisedVariationCount"))),
                 "campaign_count_detected": int(_safe_float(p_data.get("campaignCount"))),
                 "keyword_count_detected": int(_safe_float(p_data.get("keywordCount"))),
@@ -442,6 +780,7 @@ def fetch_asin_traffic_intelligence(
                 "channel_distribution": ch_dist,
                 "keyword_tier_distribution": tier_dist,
                 "top_variations": variations,
+                "top_campaigns_by_type": p_data.get("topCampaignsByType") or [],
             }
 
     # 3. get_asin_keyword_count_trends (14d daily indexed organic vs ad keyword count & position breakdown)
@@ -578,8 +917,26 @@ if __name__ == "__main__":
     import sys
 
     if len(sys.argv) < 2:
-        print("Usage: python xydc_client.py <ASIN> [COUNTRY]")
+        print("Usage: python xydc_client.py --check-quota | <ASIN> [COUNTRY]")
         sys.exit(1)
+
+    if sys.argv[1] in ("--check-quota", "--quota"):
+        cfgs = resolve_xydc_configs()
+        if not cfgs:
+            print("[xydc-mcp] No xydc-mcp accounts configured.")
+            sys.exit(1)
+        for acc in cfgs:
+            q = check_account_quota(acc)
+            wk = q.get("weekly") or {}
+            mo = q.get("monthly") or {}
+            print(
+                f"  [{q['name']}] ok={q['ok']} callable={q['callable']} "
+                f"totalAvailable={q['total_available']} maxSingleCall={q['max_single_call']} "
+                f"weekly={wk.get('remaining')}/{wk.get('limit')} (reset {wk.get('resetTime')}) "
+                f"monthly={mo.get('remaining')}/{mo.get('limit')} restrictions={q['restrictions']}"
+            )
+        sys.exit(0)
+
     asin_arg = sys.argv[1]
     country_arg = sys.argv[2] if len(sys.argv) > 2 else "US"
     res = fetch_asin_keyword_ranks(asin_arg, country=country_arg)

@@ -1,8 +1,8 @@
 interface:
-  display_name: "领星广告调整手册"
-  short_description: "Deep Lingxing + Xiyou (xydc-mcp) Amazon ads audit and full 13-section adjustment playbook"
+  display_name: "领星广告调整手册 v2"
+  short_description: "Stage-aware Lingxing + Xiyou (xydc-mcp) Amazon ads audit and full 13-section adjustment playbook (v2)"
   brand_color: "#1677FF"
-  default_prompt: "Use $lingxing-ads-playbook to audit my Amazon ads for ASIN <ASIN> on US via Lingxing MCP and Xiyou MCP (xydc-mcp), verify North-Star outcomes, and output the complete 13-section product-fit adjustment playbook and conflict-free bulk TSV."
+  default_prompt: "Use $lingxing-ads-playbook to determine lifecycle stage & targets, audit my Amazon ads for ASIN <ASIN> on US via Lingxing MCP and Xiyou MCP (xydc-mcp), verify North-Star outcomes, and output the complete 13-section (including 0.0) product-fit adjustment playbook and conflict-free bulk TSV."
 
 dependencies:
   tools:

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -54,10 +55,11 @@ def report_window(days: int) -> str:
 
 
 def get_multi_windows(macro_days: int = 30) -> dict[str, str]:
-    """Calculate date windows for macro 30-day baseline, medium 7-day trend, and micro 3-day latest slice."""
+    """Calculate date windows for macro 30d baseline, 14d/7d conversion windows, and 3d micro slice (all ending T-1)."""
     yesterday = date.today() - timedelta(days=1)
     return {
         "macro_30d": f"{(yesterday - timedelta(days=macro_days - 1)).isoformat()} - {yesterday.isoformat()}",
+        "recent_14d": f"{(yesterday - timedelta(days=13)).isoformat()} - {yesterday.isoformat()}",
         "recent_7d": f"{(yesterday - timedelta(days=6)).isoformat()} - {yesterday.isoformat()}",
         "recent_3d": f"{(yesterday - timedelta(days=2)).isoformat()} - {yesterday.isoformat()}",
     }
@@ -134,16 +136,29 @@ def listing_lookup(sid: Any, asin: str) -> list[dict]:
 
 
 def infer_shop_hint_from_portfolio(portfolio: str | None) -> str | None:
-    """Infer shop alias hint encoded in portfolio naming conventions (e.g., DL2507US -> dilu, -Q- / QF -> quafe, GD -> gdor)."""
+    """Infer optional shop alias hint from portfolio naming via LINGXING_SHOP_HINTS env JSON map.
+
+    Example: LINGXING_SHOP_HINTS='{"SHOPA": "shop_a", "SHOPB": "shop_b"}'
+    """
     if not portfolio:
         return None
+    raw_map = os.environ.get("LINGXING_SHOP_HINTS") or ""
+    if not raw_map.strip():
+        return None
+    try:
+        mapping = json.loads(raw_map)
+    except Exception:
+        return None
+    if not isinstance(mapping, dict):
+        return None
     p = portfolio.strip().upper()
-    if re.search(r"(?:^|[-_])DL\d*", p) or "DILU" in p:
-        return "dilu"
-    if re.search(r"(?:^|[-_])(?:QF\d*|Q)(?:[-_]|$)", p) or "QUAFE" in p:
-        return "quafe"
-    if re.search(r"(?:^|[-_])GD\d*", p) or "GDOR" in p:
-        return "gdor"
+    for prefix, alias in mapping.items():
+        pref = str(prefix or "").strip().upper()
+        al = str(alias or "").strip()
+        if not pref or not al:
+            continue
+        if re.search(rf"(?:^|[-_]){re.escape(pref)}\d*", p) or pref in p:
+            return al
     return None
 
 
@@ -298,7 +313,7 @@ def resolve_shop(
                         "resolved_portfolio_id": pf_id,
                         "note": f"multi-shop ASIN {shared_shop_aliases}; matched portfolio owner {s_row.get('alias')}",
                     }
-            # Disambiguate 2: Portfolio name hint (DL -> dilu, QF/-Q- -> quafe, GD -> gdor)
+            # Disambiguate 2: Portfolio name hint (optional LINGXING_SHOP_HINTS prefix mapping)
             hint = infer_shop_hint_from_portfolio(portfolio)
             if hint:
                 hint_hits = [h for h in hits if hint in str(h[0].get("alias") or "").lower()]
@@ -402,6 +417,7 @@ def build_report_specs(
     """Describe every ads report pull as data so they can run in parallel."""
     pid = str(profile_id)
     w30 = windows["macro_30d"]
+    w14 = windows.get("recent_14d")
     w7 = windows["recent_7d"]
     w3 = windows["recent_3d"]
 
@@ -459,6 +475,13 @@ def build_report_specs(
         ("product_ads", "product_ads.json", "ad_campaign_product_report", prod_params, 15, True),
         ("portfolios", "portfolios.json", "ad_portfolio_report_shop", base_report_params(pid, w30), 20, True),
     ]
+    if w14:
+        specs.extend([
+            ("campaigns_14d", "campaign_report_14d.json", "ad_campaign_report", base_report_params(pid, w14, camp_extra), 20, False),
+            ("keywords_14d", "keywords_14d.json", "ad_campaign_keyword_report", base_report_params(pid, w14, kw_extra), 20, False),
+            ("search_terms_14d", "search_terms_14d.json", "ad_campaign_search_term_report", base_report_params(pid, w14, st_extra), 30, False),
+            ("targets_14d", "targets_14d.json", "ad_campaign_targeting_report", base_report_params(pid, w14, tg_extra), 20, False),
+        ])
     out = [
         FetchSpec(key=key, filename=fname, fetch=paginated(tool, params, pages), required=req)
         for key, fname, tool, params, pages, req in specs
@@ -840,6 +863,666 @@ def probe_deal_and_promotions(
     return deal_info
 
 
+def _safe_num(val: Any, default: float = 0.0) -> float:
+    if val is None or val == "" or val == "--":
+        return default
+    try:
+        s = str(val).replace("%", "").replace(",", "").replace("$", "").strip()
+        return float(s) if s and s != "--" else default
+    except Exception:
+        return default
+
+
+def _clean_acos_val(raw_acos: Any, spend: float, sales: float) -> float:
+    if sales > 0:
+        return round(spend / sales * 100.0, 2)
+    v = _safe_num(raw_acos, 0.0)
+    if 0.0 < v < 5000.0:
+        return round(v, 2)
+    return 999.0 if spend > 0 else 0.0
+
+
+def _extract_next_token(payload: Any) -> str | None:
+    cur = payload
+    for _ in range(4):
+        if not isinstance(cur, dict):
+            break
+        nt = cur.get("next_token")
+        if isinstance(nt, str) and nt.strip():
+            return nt.strip()
+        cur = cur.get("data")
+    return None
+
+
+def _account_id_param(sid: str | None, profile_id: str | None) -> dict[str, int]:
+    s_str = str(sid or "").strip()
+    if s_str.isdigit():
+        return {"sid": int(s_str)}
+    p_str = str(profile_id or "").strip()
+    if p_str.isdigit():
+        return {"profile_id": int(p_str)}
+    raise lx.LingxingError(f"Neither sid ({sid}) nor profile_id ({profile_id}) is a valid integer")
+
+
+def _paginate_cursor(tool_id: str, base_params: dict[str, Any], max_pages: int = 25) -> list[dict]:
+    """Paginate Lingxing v2/v3 endpoints using offset/length + next_token (strictly no `page` param)."""
+    all_rows: list[dict] = []
+    length = max(1, min(200, int(base_params.get("length") or 200)))
+    params = dict(base_params)
+    params.pop("page", None)
+    params["length"] = length
+    params.setdefault("offset", 0)
+
+    seen_tokens: set[str] = set()
+    for _ in range(max_pages):
+        payload = lx.action(tool_id, params)
+        chunk = lx.rows(payload)
+        if not chunk:
+            break
+        all_rows.extend(chunk)
+        if len(chunk) < length:
+            break
+        total = lx._declared_total(payload)
+        if total is not None and len(all_rows) >= total:
+            break
+        nt = _extract_next_token(payload)
+        if nt and nt not in seen_tokens:
+            seen_tokens.add(nt)
+            params["next_token"] = nt
+        elif total is not None and len(all_rows) < total:
+            params.pop("next_token", None)
+            params["offset"] = len(all_rows)
+        else:
+            break
+    return all_rows
+
+
+def _is_brand_or_display_campaign(row: dict[str, Any]) -> bool:
+    st = str(row.get("sponsored_type") or "").strip().lower()
+    at = str(row.get("ads_type") or row.get("ad_type") or row.get("campaign_type") or "").strip().lower()
+    if st in ("hsa", "sb", "sbv", "sd"):
+        return True
+    if at.startswith(("sb", "hsa", "sd")):
+        return True
+    return False
+
+
+def _detect_ad_format(row: dict[str, Any]) -> str:
+    st = str(row.get("sponsored_type") or "").strip().lower()
+    at = str(row.get("ads_type") or row.get("ad_type") or "").strip().lower()
+    ct = str(row.get("creative_type") or "").strip().upper()
+    ag_ct = str(row.get("ad_group_creative_type") or "").upper()
+    if st == "sd" or at.startswith("sd"):
+        return "SD"
+    if at == "sbv" or ct == "VIDEO" or "VIDEO" in ag_ct:
+        return "SBV"
+    if st in ("hsa", "sb") or at.startswith(("sb", "hsa")):
+        return "SB"
+    return "SP"
+
+
+def _extract_campaign_asins(row: dict[str, Any]) -> set[str]:
+    found: set[str] = set()
+    raw_ca = row.get("creative_asins")
+    if isinstance(raw_ca, list):
+        for item in raw_ca:
+            a = str(item or "").strip().upper()
+            if re.fullmatch(r"B0[0-9A-Z]{8}", a):
+                found.add(a)
+    elif isinstance(raw_ca, str):
+        for m in re.findall(r"B0[0-9A-Z]{8}", raw_ca.upper()):
+            found.add(m)
+    for k in ("asin", "advertised_asin", "creative", "landing_page"):
+        val = row.get(k)
+        if not val:
+            continue
+        blob = val if isinstance(val, str) else json.dumps(val, ensure_ascii=False)
+        for m in re.findall(r"B0[0-9A-Z]{8}", blob.upper()):
+            found.add(m)
+    return found
+
+
+def fetch_sp_static_negatives(
+    sid: str,
+    profile_id: str,
+    local_campaigns: list[dict],
+    local_ad_groups: list[dict],
+    asin_keys: set[str],
+    portfolio_id: str | None,
+    outdir: Path,
+    max_workers: int = DEFAULT_CONCURRENCY,
+) -> dict[str, int]:
+    """Fetch static SP negative keywords and negative targets scoped strictly to this portfolio/ASIN's SP campaigns.
+
+    Never passes `state` (rejected by schema `additionalProperties: false`) and never queries store-wide unfiltered rows.
+    """
+    acct_param = _account_id_param(sid, profile_id)
+    group_name_by_id: dict[str, str] = {}
+    for g in (local_ad_groups if isinstance(local_ad_groups, list) else []):
+        if not isinstance(g, dict):
+            continue
+        gid = str(g.get("ad_group_id") or g.get("key") or "").strip()
+        gname = str(g.get("name") or g.get("ad_group_name") or "").strip()
+        if gid and gname:
+            group_name_by_id[gid] = gname
+
+    sp_camp_by_id: dict[int, dict[str, Any]] = {}
+    archived_sp_by_id: dict[int, dict[str, Any]] = {}
+    candidates = [c for c in (local_campaigns if isinstance(local_campaigns, list) else []) if isinstance(c, dict)]
+    candidates.sort(key=lambda c: _safe_num(c.get("spends")), reverse=True)
+
+    for c in candidates:
+        cid_str = str(c.get("campaign_id") or c.get("key") or "").strip()
+        cname = str(c.get("name") or c.get("campaign_name") or "").strip()
+        if not cid_str.isdigit() or not cname:
+            continue
+        if _is_brand_or_display_campaign(c):
+            continue
+        if portfolio_id:
+            c_pf = str(c.get("portfolio_id") or "").strip()
+            if c_pf and c_pf != str(portfolio_id).strip():
+                continue
+        else:
+            if asin_keys and cid_str not in asin_keys and cname not in asin_keys:
+                continue
+        cid_int = int(cid_str)
+        st = str(c.get("state") or "").strip().lower()
+        if st == "archived":
+            archived_sp_by_id[cid_int] = c
+        else:
+            sp_camp_by_id[cid_int] = c
+        if not portfolio_id and len(sp_camp_by_id) >= 35:
+            break
+
+    if not sp_camp_by_id and archived_sp_by_id:
+        for cid_int, c in list(archived_sp_by_id.items())[:15]:
+            sp_camp_by_id[cid_int] = c
+
+    neg_keywords: list[dict] = []
+    neg_targets: list[dict] = []
+
+    if sp_camp_by_id:
+        tasks: list[tuple[str, int]] = []
+        for cid_int in sp_camp_by_id:
+            tasks.append(("keyword", cid_int))
+            tasks.append(("target", cid_int))
+
+        def _pull_one(ttype: str, cid_val: int) -> list[dict]:
+            # Strict schema compliance: only sid/profile_id, campaign_id, target_type, offset, length (+ next_token)
+            req_params: dict[str, Any] = {
+                **acct_param,
+                "campaign_id": int(cid_val),
+                "target_type": ttype,
+                "offset": 0,
+                "length": 200,
+            }
+            return _paginate_cursor("ad_sp_negative_target_list", req_params, max_pages=15)
+
+        seen_kw_ids: set[str] = set()
+        seen_tg_ids: set[str] = set()
+        workers = max(1, min(max_workers, len(tasks), 6))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futs = [(ttype, cid_int, pool.submit(_pull_one, ttype, cid_int)) for ttype, cid_int in tasks]
+            for ttype, cid_int, fut in futs:
+                try:
+                    rows = fut.result()
+                except Exception as exc:
+                    print(
+                        f"Warning: ad_sp_negative_target_list({ttype}, campaign_id={cid_int}) failed: {exc}",
+                        file=sys.stderr,
+                    )
+                    continue
+                c_meta = sp_camp_by_id.get(cid_int) or {}
+                c_name = str(c_meta.get("name") or c_meta.get("campaign_name") or "")
+                c_pf_id = str(c_meta.get("portfolio_id") or portfolio_id or "")
+                for r in rows:
+                    if not isinstance(r, dict):
+                        continue
+                    ag_raw = r.get("ad_group_id")
+                    ag_str = str(ag_raw or "").strip()
+                    is_ag_scope = ag_raw not in (None, 0, "0", "")
+                    tid_str = str(r.get("target_id") or f"{cid_int}:{ag_str}:{r.get('negative_match_type')}:{r.get('negative_text')}")
+                    enriched = dict(r)
+                    enriched["campaign_name"] = c_name
+                    enriched["portfolio_id"] = c_pf_id
+                    enriched["ad_group_name"] = group_name_by_id.get(ag_str, "") if is_ag_scope else ""
+                    enriched["scope_level"] = "ad_group" if is_ag_scope else "campaign"
+                    enriched["ad_product"] = "SP"
+                    if ttype == "keyword":
+                        if tid_str in seen_kw_ids:
+                            continue
+                        seen_kw_ids.add(tid_str)
+                        enriched["keyword_text"] = str(r.get("negative_text") or "")
+                        enriched["match_type"] = str(r.get("negative_match_type") or "")
+                        neg_keywords.append(enriched)
+                    else:
+                        if tid_str in seen_tg_ids:
+                            continue
+                        seen_tg_ids.add(tid_str)
+                        enriched["target_text"] = str(r.get("negative_text") or "")
+                        neg_targets.append(enriched)
+
+    save(outdir / "sp_negative_keywords.json", neg_keywords)
+    save(outdir / "sp_negative_targets.json", neg_targets)
+    return {
+        "sp_negative_keywords": len(neg_keywords),
+        "sp_negative_targets": len(neg_targets),
+    }
+
+
+def probe_shared_brand_and_hsa_intelligence(
+    sid: str,
+    profile_id: str,
+    asin: str,
+    portfolio_id: str | None,
+    local_campaigns: list[dict],
+    asin_keys: set[str],
+    multi_win: dict[str, str],
+    outdir: Path,
+    max_workers: int = DEFAULT_CONCURRENCY,
+) -> dict[str, int]:
+    """Detect cross-portfolio shared SB/SBV/SD campaigns containing target ASIN, and pull HSA negatives & 7d placements."""
+    extra_counts: dict[str, int] = {}
+    asin_up = asin.strip().upper()
+    pid_str = str(profile_id)
+    acct_param = _account_id_param(sid, profile_id)
+    w30 = multi_win["macro_30d"]
+    w7 = multi_win["recent_7d"]
+
+    # Determine primary portfolio_id fallback when --portfolio was omitted
+    eff_pf_id = str(portfolio_id).strip() if portfolio_id else ""
+    if not eff_pf_id:
+        pf_spend: dict[str, float] = {}
+        for lc in (local_campaigns if isinstance(local_campaigns, list) else []):
+            if not isinstance(lc, dict) or _is_brand_or_display_campaign(lc):
+                continue
+            cid_s = str(lc.get("campaign_id") or lc.get("key") or "")
+            cn_s = str(lc.get("name") or lc.get("campaign_name") or "")
+            if asin_keys and cid_s not in asin_keys and cn_s not in asin_keys:
+                continue
+            pf_s = str(lc.get("portfolio_id") or "").strip()
+            if pf_s:
+                pf_spend[pf_s] = pf_spend.get(pf_s, 0.0) + _safe_num(lc.get("spends")) + 0.01
+        if pf_spend:
+            eff_pf_id = max(pf_spend.items(), key=lambda kv: kv[1])[0]
+
+    shared_campaigns: list[dict] = []
+    store_brand_camps_30d: list[dict] = []
+    try:
+        store_all_30d = lx.paginate(
+            "ad_campaign_report",
+            base_report_params(pid_str, w30, {"length": 500}),
+            max_pages=6,
+        )
+        store_brand_camps_30d = [
+            c for c in store_all_30d
+            if isinstance(c, dict)
+            and (c.get("campaign_id") or c.get("key"))
+            and (c.get("name") or c.get("campaign_name"))
+            and _is_brand_or_display_campaign(c)
+        ]
+    except Exception as exc:
+        print(f"Warning: store-wide brand campaign probe failed: {exc}", file=sys.stderr)
+
+    # Enrich missing creative_asins from ad_hsa_campaigns and ad_sd_product_ads if needed
+    camp_asin_map: dict[str, set[str]] = {}
+    has_missing_hsa_asins = False
+    has_sd_campaigns = False
+    for c in store_brand_camps_30d:
+        cid_s = str(c.get("campaign_id") or c.get("key") or "").strip()
+        extracted = _extract_campaign_asins(c)
+        if extracted:
+            camp_asin_map[cid_s] = extracted
+        else:
+            fmt = _detect_ad_format(c)
+            if fmt == "SD":
+                has_sd_campaigns = True
+            else:
+                has_missing_hsa_asins = True
+
+    if has_missing_hsa_asins:
+        try:
+            hsa_list = _paginate_cursor("ad_hsa_campaigns", {**acct_param, "offset": 0, "length": 200}, max_pages=10)
+            for hc in hsa_list:
+                cid_s = str(hc.get("campaign_id") or "").strip()
+                if cid_s and not camp_asin_map.get(cid_s):
+                    camp_asin_map[cid_s] = _extract_campaign_asins(hc)
+        except Exception:
+            pass
+
+    if has_sd_campaigns:
+        try:
+            sd_ads = _paginate_cursor("ad_sd_product_ads", {**acct_param, "offset": 0, "length": 200}, max_pages=10)
+            for sa in sd_ads:
+                cid_s = str(sa.get("campaign_id") or "").strip()
+                a_val = str(sa.get("asin") or "").strip().upper()
+                if cid_s and re.fullmatch(r"B0[0-9A-Z]{8}", a_val):
+                    camp_asin_map.setdefault(cid_s, set()).add(a_val)
+        except Exception:
+            pass
+
+    matched_raw: list[tuple[dict, list[str]]] = []
+    for c in store_brand_camps_30d:
+        cid_s = str(c.get("campaign_id") or c.get("key") or "").strip()
+        c_asins = sorted(camp_asin_map.get(cid_s) or _extract_campaign_asins(c))
+        if asin_up not in c_asins:
+            continue
+        c_pf = str(c.get("portfolio_id") or "").strip()
+        # Exclude campaigns that already belong to the target portfolio itself
+        if portfolio_id and c_pf == str(portfolio_id).strip():
+            continue
+        if not portfolio_id and eff_pf_id and c_pf == eff_pf_id and len(c_asins) <= 1:
+            continue
+        if not portfolio_id and not eff_pf_id and len(c_asins) <= 1:
+            continue
+        matched_raw.append((c, c_asins))
+
+    brand_7d_by_cid: dict[str, dict] = {}
+    if matched_raw:
+        try:
+            store_all_7d = lx.paginate(
+                "ad_campaign_report",
+                base_report_params(pid_str, w7, {"length": 500}),
+                max_pages=6,
+            )
+            for c7 in store_all_7d:
+                if isinstance(c7, dict) and (c7.get("campaign_id") or c7.get("key")):
+                    brand_7d_by_cid[str(c7.get("campaign_id") or c7.get("key")).strip()] = c7
+        except Exception:
+            pass
+
+    for c, c_asins in matched_raw:
+        cid_s = str(c.get("campaign_id") or c.get("key") or "").strip()
+        c7 = brand_7d_by_cid.get(cid_s) or {}
+        sp30 = round(_safe_num(c.get("spends") or c.get("cost")), 2)
+        sl30 = round(_safe_num(c.get("sales")), 2)
+        od30 = int(_safe_num(c.get("orders")))
+        ck30 = int(_safe_num(c.get("clicks")))
+        im30 = int(_safe_num(c.get("impressions")))
+        sp7 = round(_safe_num(c7.get("spends") or c7.get("cost")), 2)
+        sl7 = round(_safe_num(c7.get("sales")), 2)
+        od7 = int(_safe_num(c7.get("orders")))
+        ck7 = int(_safe_num(c7.get("clicks")))
+        im7 = int(_safe_num(c7.get("impressions")))
+
+        item = dict(c)
+        item["campaign_id"] = cid_s
+        item["campaign_name"] = str(c.get("name") or c.get("campaign_name") or "")
+        item["portfolio_id"] = str(c.get("portfolio_id") or "")
+        item["portfolio_name"] = str(c.get("portfolio_name") or "")
+        item["ad_format"] = _detect_ad_format(c)
+        item["target_asin"] = asin_up
+        item["creative_asins"] = c_asins
+        item["shared_asin_count"] = len(c_asins)
+        item["is_shared_multi_asin_campaign"] = True
+        item["is_multi_asin"] = len(c_asins) > 1
+        item["is_cross_portfolio"] = bool(eff_pf_id and item["portfolio_id"] != eff_pf_id)
+        item["spend_30d"] = sp30
+        item["sales_30d"] = sl30
+        item["orders_30d"] = od30
+        item["clicks_30d"] = ck30
+        item["impressions_30d"] = im30
+        item["acos_30d"] = _clean_acos_val(c.get("acos"), sp30, sl30)
+        item["roas_30d"] = round(sl30 / sp30, 2) if sp30 > 0 else round(_safe_num(c.get("roas")), 2)
+        item["cpc_30d"] = round(sp30 / ck30, 2) if ck30 > 0 else round(_safe_num(c.get("cpc")), 2)
+        item["cvr_30d"] = round(od30 / ck30 * 100.0, 2) if ck30 > 0 else round(_safe_num(c.get("cvr")), 2)
+        item["spend_7d"] = sp7
+        item["sales_7d"] = sl7
+        item["orders_7d"] = od7
+        item["clicks_7d"] = ck7
+        item["impressions_7d"] = im7
+        item["acos_7d"] = _clean_acos_val(c7.get("acos"), sp7, sl7)
+        shared_campaigns.append(item)
+
+    shared_campaigns.sort(key=lambda x: x.get("spend_30d", 0.0), reverse=True)
+    save(outdir / "shared_brand_campaigns.json", shared_campaigns)
+    extra_counts["shared_brand_campaigns"] = len(shared_campaigns)
+
+    # Collect local + shared HSA/SB/SBV campaigns for conditional HSA negative & placement pulls
+    relevant_hsa_by_cid: dict[str, dict[str, Any]] = {}
+    for lc in (local_campaigns if isinstance(local_campaigns, list) else []):
+        if not isinstance(lc, dict):
+            continue
+        cid_s = str(lc.get("campaign_id") or lc.get("key") or "").strip()
+        cname = str(lc.get("name") or lc.get("campaign_name") or "").strip()
+        if not cid_s or not cname:
+            continue
+        fmt = _detect_ad_format(lc)
+        if fmt not in ("SB", "SBV"):
+            continue
+        if not portfolio_id:
+            lc_asins = camp_asin_map.get(cid_s) or _extract_campaign_asins(lc)
+            if asin_up not in lc_asins and cid_s not in asin_keys and cname not in asin_keys:
+                continue
+        relevant_hsa_by_cid[cid_s] = {
+            "campaign_name": cname,
+            "portfolio_id": str(lc.get("portfolio_id") or portfolio_id or ""),
+            "portfolio_name": str(lc.get("portfolio_name") or ""),
+            "ad_format": fmt,
+            "is_shared_multi_asin_campaign": False,
+        }
+
+    for sc in shared_campaigns:
+        cid_s = str(sc.get("campaign_id") or "").strip()
+        fmt = str(sc.get("ad_format") or _detect_ad_format(sc))
+        if cid_s and fmt in ("SB", "SBV"):
+            relevant_hsa_by_cid[cid_s] = {
+                "campaign_name": str(sc.get("campaign_name") or sc.get("name") or ""),
+                "portfolio_id": str(sc.get("portfolio_id") or ""),
+                "portfolio_name": str(sc.get("portfolio_name") or ""),
+                "ad_format": fmt,
+                "is_shared_multi_asin_campaign": bool(sc.get("is_shared_multi_asin_campaign", True)),
+            }
+
+    if not relevant_hsa_by_cid:
+        return extra_counts
+
+    # 1. ad_hsa_negative_keywords -> hsa_negative_keywords.json
+    try:
+        raw_hsa_neg_kw = _paginate_cursor("ad_hsa_negative_keywords", {**acct_param, "offset": 0, "length": 200}, max_pages=25)
+        hsa_neg_kw: list[dict] = []
+        for r in raw_hsa_neg_kw:
+            cid_s = str(r.get("campaign_id") or "").strip()
+            if cid_s not in relevant_hsa_by_cid:
+                continue
+            meta_h = relevant_hsa_by_cid[cid_s]
+            ag_raw = r.get("ad_group_id")
+            item = dict(r)
+            item["campaign_name"] = meta_h["campaign_name"]
+            item["portfolio_id"] = meta_h["portfolio_id"]
+            item["portfolio_name"] = meta_h["portfolio_name"]
+            item["ad_format"] = meta_h["ad_format"]
+            item["is_shared_multi_asin_campaign"] = meta_h["is_shared_multi_asin_campaign"]
+            item["scope_level"] = "ad_group" if ag_raw not in (None, 0, "0", "") else "campaign"
+            item["ad_product"] = "HSA"
+            item["negative_text"] = str(r.get("keyword_text") or "")
+            item["negative_match_type"] = str(r.get("match_type") or "")
+            hsa_neg_kw.append(item)
+        save(outdir / "hsa_negative_keywords.json", hsa_neg_kw)
+        extra_counts["hsa_negative_keywords"] = len(hsa_neg_kw)
+    except Exception as exc:
+        print(f"Warning: ad_hsa_negative_keywords degraded gracefully: {exc}", file=sys.stderr)
+
+    # 2. ad_hsa_negative_targets -> hsa_negative_targets.json
+    try:
+        raw_hsa_neg_tg = _paginate_cursor("ad_hsa_negative_targets", {**acct_param, "offset": 0, "length": 200}, max_pages=25)
+        hsa_neg_tg: list[dict] = []
+        for r in raw_hsa_neg_tg:
+            cid_s = str(r.get("campaign_id") or "").strip()
+            if cid_s not in relevant_hsa_by_cid:
+                continue
+            meta_h = relevant_hsa_by_cid[cid_s]
+            ag_raw = r.get("ad_group_id")
+            expr_txt = str(r.get("resolved_expression") or r.get("expression") or "")
+            item = dict(r)
+            item["campaign_name"] = meta_h["campaign_name"]
+            item["portfolio_id"] = meta_h["portfolio_id"]
+            item["portfolio_name"] = meta_h["portfolio_name"]
+            item["ad_format"] = meta_h["ad_format"]
+            item["is_shared_multi_asin_campaign"] = meta_h["is_shared_multi_asin_campaign"]
+            item["scope_level"] = "ad_group" if ag_raw not in (None, 0, "0", "") else "campaign"
+            item["ad_product"] = "HSA"
+            item["negative_text"] = expr_txt
+            item["target_text"] = expr_txt
+            hsa_neg_tg.append(item)
+        save(outdir / "hsa_negative_targets.json", hsa_neg_tg)
+        extra_counts["hsa_negative_targets"] = len(hsa_neg_tg)
+    except Exception as exc:
+        print(f"Warning: ad_hsa_negative_targets degraded gracefully: {exc}", file=sys.stderr)
+
+    # 3. ad_hsa_campaign_placement_reports (single-day report_date, cost field) -> hsa_placement_report_7d.json
+    try:
+        bounds_7 = split_window(w7)
+        if bounds_7:
+            d_start = datetime.strptime(bounds_7[0], "%Y-%m-%d").date()
+            d_end = datetime.strptime(bounds_7[1], "%Y-%m-%d").date()
+            day_strs = [
+                (d_start + timedelta(days=i)).isoformat()
+                for i in range(max(1, (d_end - d_start).days + 1))
+            ]
+
+            def _pull_hsa_day(d_iso: str) -> list[dict]:
+                return _paginate_cursor(
+                    "ad_hsa_campaign_placement_reports",
+                    {**acct_param, "report_date": d_iso, "offset": 0, "length": 200},
+                    max_pages=10,
+                )
+
+            daily_filtered: list[dict] = []
+            with ThreadPoolExecutor(max_workers=max(1, min(max_workers, len(day_strs), 7))) as pool:
+                day_futs = [(d_iso, pool.submit(_pull_hsa_day, d_iso)) for d_iso in day_strs]
+                for d_iso, fut in day_futs:
+                    try:
+                        d_rows = fut.result()
+                    except Exception as exc:
+                        print(f"Warning: ad_hsa_campaign_placement_reports({d_iso}) skipped: {exc}", file=sys.stderr)
+                        continue
+                    for r in d_rows:
+                        cid_s = str(r.get("campaign_id") or "").strip()
+                        if cid_s in relevant_hsa_by_cid:
+                            daily_filtered.append(r)
+
+            grouped_pl: dict[tuple[str, str], dict[str, Any]] = {}
+            camp_tot_cost: dict[str, float] = {}
+            for r in daily_filtered:
+                cid_s = str(r.get("campaign_id") or "").strip()
+                pl_type = str(r.get("placement_type") or r.get("placement") or "Unknown").strip()
+                cost_v = _safe_num(r.get("cost"))
+                sales_v = _safe_num(r.get("sales"))
+                orders_v = int(_safe_num(r.get("orders")))
+                units_v = int(_safe_num(r.get("units")))
+                same_units_v = int(_safe_num(r.get("same_units")))
+                clicks_v = int(_safe_num(r.get("clicks")))
+                imps_v = int(_safe_num(r.get("impressions")))
+                ntb_ord_v = int(_safe_num(r.get("new_to_brand_orders")))
+                ntb_sales_v = _safe_num(r.get("new_to_brand_sales"))
+                ntb_units_v = int(_safe_num(r.get("new_to_brand_units")))
+                bs_v = int(_safe_num(r.get("branded_searches")))
+                v5_v = int(_safe_num(r.get("video5secondviews")))
+                vq1_v = int(_safe_num(r.get("videofirstquartileviews")))
+                vq2_v = int(_safe_num(r.get("videomidpointviews")))
+                vq3_v = int(_safe_num(r.get("videothirdquartileviews")))
+
+                camp_tot_cost[cid_s] = camp_tot_cost.get(cid_s, 0.0) + cost_v
+                g = grouped_pl.setdefault((cid_s, pl_type), {
+                    "cost": 0.0,
+                    "sales": 0.0,
+                    "orders": 0,
+                    "units": 0,
+                    "same_units": 0,
+                    "clicks": 0,
+                    "impressions": 0,
+                    "new_to_brand_orders": 0,
+                    "new_to_brand_sales": 0.0,
+                    "new_to_brand_units": 0,
+                    "branded_searches": 0,
+                    "video5secondviews": 0,
+                    "videofirstquartileviews": 0,
+                    "videomidpointviews": 0,
+                    "videothirdquartileviews": 0,
+                    "daily_breakdown": [],
+                })
+                g["cost"] += cost_v
+                g["sales"] += sales_v
+                g["orders"] += orders_v
+                g["units"] += units_v
+                g["same_units"] += same_units_v
+                g["clicks"] += clicks_v
+                g["impressions"] += imps_v
+                g["new_to_brand_orders"] += ntb_ord_v
+                g["new_to_brand_sales"] += ntb_sales_v
+                g["new_to_brand_units"] += ntb_units_v
+                g["branded_searches"] += bs_v
+                g["video5secondviews"] += v5_v
+                g["videofirstquartileviews"] += vq1_v
+                g["videomidpointviews"] += vq2_v
+                g["videothirdquartileviews"] += vq3_v
+                g["daily_breakdown"].append({
+                    "report_date": str(r.get("report_date") or ""),
+                    "cost": round(cost_v, 2),
+                    "sales": round(sales_v, 2),
+                    "orders": orders_v,
+                    "clicks": clicks_v,
+                    "impressions": imps_v,
+                    "new_to_brand_orders": ntb_ord_v,
+                    "video5secondviews": v5_v,
+                })
+
+            agg_rows: list[dict] = []
+            for (cid_s, pl_type), g in grouped_pl.items():
+                meta_h = relevant_hsa_by_cid[cid_s]
+                c_tot = camp_tot_cost.get(cid_s, 0.0)
+                cost_r = round(g["cost"], 2)
+                sales_r = round(g["sales"], 2)
+                clicks_r = g["clicks"]
+                imps_r = g["impressions"]
+                orders_r = g["orders"]
+                g["daily_breakdown"].sort(key=lambda x: x["report_date"])
+                agg_rows.append({
+                    "campaign_id": int(cid_s) if cid_s.isdigit() else cid_s,
+                    "campaign_name": meta_h["campaign_name"],
+                    "portfolio_id": meta_h["portfolio_id"],
+                    "portfolio_name": meta_h["portfolio_name"],
+                    "ad_format": meta_h["ad_format"],
+                    "is_shared_multi_asin_campaign": meta_h["is_shared_multi_asin_campaign"],
+                    "ad_product": "HSA",
+                    "window": w7,
+                    "days_returned": len(g["daily_breakdown"]),
+                    "placement_type": pl_type,
+                    "placement": pl_type,
+                    "cost": cost_r,
+                    "spends": cost_r,
+                    "spend_share_pct": round(cost_r / c_tot * 100.0, 2) if c_tot > 0 else 0.0,
+                    "sales": sales_r,
+                    "orders": orders_r,
+                    "units": g["units"],
+                    "same_units": g["same_units"],
+                    "clicks": clicks_r,
+                    "impressions": imps_r,
+                    "cpc": round(cost_r / clicks_r, 2) if clicks_r > 0 else 0.0,
+                    "ctr": round(clicks_r / imps_r * 100.0, 2) if imps_r > 0 else 0.0,
+                    "cvr": round(orders_r / clicks_r * 100.0, 2) if clicks_r > 0 else 0.0,
+                    "acos": _clean_acos_val(None, cost_r, sales_r),
+                    "roas": round(sales_r / cost_r, 2) if cost_r > 0 else 0.0,
+                    "new_to_brand_orders": g["new_to_brand_orders"],
+                    "new_to_brand_sales": round(g["new_to_brand_sales"], 2),
+                    "new_to_brand_units": g["new_to_brand_units"],
+                    "branded_searches": g["branded_searches"],
+                    "video5secondviews": g["video5secondviews"],
+                    "videofirstquartileviews": g["videofirstquartileviews"],
+                    "videomidpointviews": g["videomidpointviews"],
+                    "videothirdquartileviews": g["videothirdquartileviews"],
+                    "daily_breakdown": g["daily_breakdown"],
+                })
+            agg_rows.sort(key=lambda x: (str(x["campaign_name"]), -x["cost"]))
+            save(outdir / "hsa_placement_report_7d.json", agg_rows)
+            extra_counts["hsa_placement_report_7d"] = len(agg_rows)
+    except Exception as exc:
+        print(f"Warning: ad_hsa_campaign_placement_reports degraded gracefully: {exc}", file=sys.stderr)
+
+    return extra_counts
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--asin", required=True)
@@ -921,6 +1604,46 @@ def main() -> int:
         for r in (product_ads if isinstance(product_ads, list) else [])
         if isinstance(r, dict)
     } | {asin}
+
+    camp_report_path = outdir / "campaign_report.json"
+    local_campaigns = json.loads(camp_report_path.read_text(encoding="utf-8")) if camp_report_path.exists() else []
+    ad_groups_path = outdir / "ad_groups.json"
+    local_ad_groups = json.loads(ad_groups_path.read_text(encoding="utf-8")) if ad_groups_path.exists() else []
+
+    # Static SP Negatives (keyword + target per SP campaign_id, strictly no `state` param)
+    try:
+        print(f"[LingXing-MCP] Fetching SP static negative keywords & targets for ASIN {asin}...")
+        sp_neg_counts = fetch_sp_static_negatives(
+            sid=sid,
+            profile_id=profile_id,
+            local_campaigns=local_campaigns,
+            local_ad_groups=local_ad_groups,
+            asin_keys=asin_keys,
+            portfolio_id=portfolio_id,
+            outdir=outdir,
+            max_workers=args.concurrency,
+        )
+        counts.update(sp_neg_counts)
+    except Exception as exc:
+        print(f"Warning: SP static negative fetch degraded gracefully: {exc}", file=sys.stderr)
+
+    # Cross-Portfolio Shared SB/SBV/SD Brand Campaigns + Conditional HSA Negatives & 7d Placements
+    try:
+        print(f"[LingXing-MCP] Probing cross-portfolio shared SB/SBV/SD campaigns & HSA intelligence...")
+        brand_hsa_counts = probe_shared_brand_and_hsa_intelligence(
+            sid=sid,
+            profile_id=profile_id,
+            asin=asin,
+            portfolio_id=portfolio_id,
+            local_campaigns=local_campaigns,
+            asin_keys=asin_keys,
+            multi_win=multi_win,
+            outdir=outdir,
+            max_workers=args.concurrency,
+        )
+        counts.update(brand_hsa_counts)
+    except Exception as exc:
+        print(f"Warning: shared brand / HSA probe degraded gracefully: {exc}", file=sys.stderr)
 
     # Xiyou Dongcha (西柚洞察) Rank, Traffic, Parent Channel Split, Keyword Count & BSR Intelligence
     try:
